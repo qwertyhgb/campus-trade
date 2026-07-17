@@ -33,7 +33,16 @@
 ### 配置
 
 1. 创建数据库并执行 `src/main/resources/db/` 下的 SQL 脚本
-2. 修改 `application-dev.yaml` 中的数据库和 Redis 连接信息
+2. 设置环境变量（或复制为 `application-local.yaml` 写入）：
+
+```bash
+# 数据库密码（必填）
+export DB_PASSWORD=your_password
+# 数据库用户名（可选，默认 root）
+export DB_USERNAME=root
+```
+
+你也可以创建 `application-local.yaml`（已 gitignored），写入自己的敏感配置，Spring Boot 会自动加载。
 
 ### 运行
 
