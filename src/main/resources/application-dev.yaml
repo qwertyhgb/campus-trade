@@ -1,0 +1,48 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/campus_trade?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    username: root
+    password: ${DB_PASSWORD}
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 0
+  
+  servlet:
+    multipart:
+      max-file-size: 5MB        # 单个文件最大 5MB（图片一般不超过这个大小）
+      max-request-size: 10MB    # 单次请求最大 10MB（防止一次传太多文件）
+
+# 开发环境配置：输出 MyBatis SQL 日志
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+upload:
+  path: D:/campus-trade-uploads   # 图片存到磁盘的哪个目录
+  url-prefix: /upload   
+  
+# Knife4j 接口文档配置
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    tags-sorter: alpha          # 接口分组按字母排序
+    operations-sorter: alpha    # 接口按字母排序
+  api-docs:
+    path: /v3/api-docs
+  group-configs:
+    - group: 'default'
+      paths-to-match: '/**'     # 扫描所有路径
+      packages-to-scan: com.ming.campustrade.controller
+
+# Knife4j 增强配置
+knife4j:
+  enable: true                  # 开启 Knife4j
+  setting:
+    language: zh_cn             # 中文界面           # 浏览器访问图片的 URL 前缀
