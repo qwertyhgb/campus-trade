@@ -31,7 +31,11 @@ public enum ResultCode {
     ORDER_NOT_FOUND(4001, "订单不存在"),
     ORDER_STATUS_ERROR(4002, "订单状态不合法"),
     PRODUCT_NOT_AVAILABLE(4003, "商品已售出或已下架"),
-    CANNOT_BUY_OWN_PRODUCT(4004, "不能购买自己的商品");
+    CANNOT_BUY_OWN_PRODUCT(4004, "不能购买自己的商品"),
+
+    // 业务相关（5001-5999 收藏模块）
+    PRODUCT_ALREADY_FAVORITED(5001, "已经收藏过了"),
+    FAVORITE_NOT_FOUND(5002, "未收藏该商品");
 
     private final Integer code;
     private final String message;
