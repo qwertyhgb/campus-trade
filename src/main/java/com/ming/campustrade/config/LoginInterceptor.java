@@ -86,7 +86,9 @@ public class LoginInterceptor implements HandlerInterceptor {
 
         // 5. 验证用户信息是否存在（Token 可能已过期或无效）
         if (userMap == null || userMap.isEmpty()) {
-            log.warn("Token 无效或已过期：token={}", token);
+            // 安全注意：不要在日志中打印完整 Token，防止日志泄露后被他人冒用身份。
+            // 这里只截取前 8 位用于辅助排查，足以区分不同 Token 又不会暴露完整凭证。
+            log.warn("Token 无效或已过期：token={}...", token.substring(0, Math.min(8, token.length())));
             return unauthorized(response);
         }
 
@@ -118,7 +120,8 @@ public class LoginInterceptor implements HandlerInterceptor {
                 Duration.ofMinutes(RedisConstants.LOGIN_USER_TTL)
         );
 
-        log.info("Token 验证通过：userId={}, username={}", userVO.getId(), userVO.getUsername());
+        // 使用 debug 级别：每个认证请求都会经过这里，info 级别在生产环境会产生海量日志
+        log.debug("Token 验证通过：userId={}, username={}", userVO.getId(), userVO.getUsername());
 
         // 9. 放行请求，继续执行后续的 Controller 方法
         return true;
