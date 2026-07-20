@@ -4,8 +4,10 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ming.campustrade.common.ResultCode;
 import com.ming.campustrade.common.constant.ProductStatus;
+import com.ming.campustrade.common.constant.RedisConstants;
 import com.ming.campustrade.common.exception.BusinessException;
 import com.ming.campustrade.dto.ProductPublishDTO;
 import com.ming.campustrade.dto.ProductQueryDTO;
@@ -18,11 +20,15 @@ import com.ming.campustrade.service.ProductService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.ProductVO;
 import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 /**
@@ -47,6 +53,12 @@ import java.util.stream.Collectors;
  * 在商品列表查询时，需要根据 sellerId 批量查询卖家信息（selectByIds），
  * 直接注入 UserMapper 最直接高效，避免通过 UserService 中转。</p>
  *
+ * <p><b>为什么注入 StringRedisTemplate 和 ObjectMapper？</b><br>
+ * 商品详情是高频读取接口（每次打开商品页都会调用），如果每次都查 MySQL，
+ * 数据库压力会很大。我们使用 Redis 缓存商品详情（Cache-Aside 模式）：
+ * 第一次查 MySQL 并把结果序列化为 JSON 存入 Redis，后续直接从 Redis 读取。
+ * StringRedisTemplate 负责 Redis 读写，ObjectMapper 负责 Java 对象 ↔ JSON 的序列化/反序列化。</p>
+ *
  * <p><b>this.xxx() 的来源：</b><br>
  * 代码中大量使用 this.save()、this.getById()、this.updateById() 等，
  * 这些方法不是这个类自己写的，而是从父类 ServiceImpl 继承来的。
@@ -56,7 +68,6 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @Service
-@SuppressWarnings("null")
 public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> implements ProductService {
 
     /**
@@ -68,16 +79,37 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
     private final UserMapper userMapper;
 
     /**
+     * Redis 操作模板，用于商品详情缓存的读写
+     *
+     * <p>StringRedisTemplate 是 Spring Data Redis 提供的操作类，
+     * 专门处理 Key 和 Value 都是 String 类型的场景。
+     * 我们把 ProductVO 序列化为 JSON 字符串存入 Redis，所以用它就够了。</p>
+     */
+    private final StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * JSON 序列化/反序列化工具（Jackson 提供）
+     *
+     * <p>用于把 ProductVO 对象转成 JSON 字符串存入 Redis，
+     * 以及从 Redis 取出 JSON 字符串后还原为 ProductVO 对象。</p>
+     */
+    private final ObjectMapper objectMapper;
+
+    /**
      * 构造器注入
      *
-     * <p>Spring 启动时发现 ProductServiceImpl 需要一个 UserMapper 类型的 Bean，
-     * 会自动去容器里找到 UserMapper（因为 @Mapper 注解已注册它）并传入。
+     * <p>Spring 启动时发现 ProductServiceImpl 需要这些类型的 Bean，
+     * 会自动去容器里找到对应实例并传入。
      * 这就是"构造器注入"——比 @Autowired 字段注入更推荐的方式。</p>
      *
-     * @param userMapper 用户数据访问层
+     * @param userMapper          用户数据访问层
+     * @param stringRedisTemplate Redis 操作模板
+     * @param objectMapper        JSON 序列化工具
      */
-    public ProductServiceImpl(UserMapper userMapper) {
+    public ProductServiceImpl(UserMapper userMapper, StringRedisTemplate stringRedisTemplate, ObjectMapper objectMapper) {
         this.userMapper = userMapper;
+        this.stringRedisTemplate = stringRedisTemplate;
+        this.objectMapper = objectMapper;
     }
 
     // ==================== 发布商品 ====================
@@ -125,7 +157,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
     /**
      * 修改商品（仅卖家本人可操作）
      *
-     * <p><b>流程：</b>查商品是否存在 → 校验是否本人 → 部分更新 → 写回数据库</p>
+     * <p><b>流程：</b>查商品是否存在 → 校验是否本人 → 部分更新 → 写回数据库 → 清除缓存</p>
      *
      * <p><b>什么是"部分更新"（Partial Update）？</b><br>
      * 前端可能只修改了标题和价格，其他字段不变。
@@ -180,6 +212,12 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         //    this.updateById() 内部执行 UPDATE product SET ... WHERE id=? AND deleted=0
         //    只更新实体中被 set 过的字段，未 set 的字段不会出现在 SQL 中
         this.updateById(product);
+
+        // 5. 清除 Redis 缓存（Cache-Aside 模式的"写后失效"策略）
+        //    商品数据变了，缓存里的旧数据必须删掉，否则用户会看到修改前的信息。
+        //    下次查询时会重新从 MySQL 加载最新数据并写入缓存。
+        evictProductCache(id);
+
         log.info("编辑商品成功：productId={}", id);
     }
 
@@ -217,26 +255,50 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
 
         // 3. 逻辑删除（@TableLogic 自动把 DELETE 转成 UPDATE SET deleted=1）
         this.removeById(id);
+
+        // 4. 清除缓存：商品已删除，缓存必须失效，否则用户还能看到已删除的商品
+        evictProductCache(id);
+
         log.info("删除商品成功：productId={}", id);
     }
 
-    // ==================== 查看商品详情 ====================
+    // ==================== 查看商品详情（带 Redis 缓存）====================
 
     /**
-     * 查看商品详情（浏览量 +1）
+     * 查看商品详情（浏览量 +1，带 Redis 缓存加速）
      *
-     * <p><b>流程：</b>查商品 → 浏览量+1 → 查卖家信息 → 拼装 VO 返回</p>
+     * <p><b>整体流程（Cache-Aside 旁路缓存模式）：</b></p>
+     * <ol>
+     *   <li>先查 Redis 缓存 → 命中则直接返回（不查 MySQL，速度快）</li>
+     *   <li>缓存未命中 → 查 MySQL 数据库</li>
+     *   <li>数据库也没有 → 缓存空值（防穿透），抛出异常</li>
+     *   <li>数据库有 → 组装 VO → 写入 Redis 缓存 → 返回</li>
+     * </ol>
      *
-     * <p><b>浏览量为什么先查再改再存，而不是直接 SQL 加 1？</b><br>
-     * 直接写 SQL（setSql("view_count = view_count + 1")）是原子操作，并发安全，
-     * 但对新手不够直观。这里用"查出来 → Java 里加 1 → 存回去"的方式更容易理解。
-     * 唯一的缺点是高并发下可能丢失少量浏览量（两人同时读到 10，各加 1 写回 11，实际应 12），
-     * 校园平台完全不会有这个问题，等量级上去了再优化也不迟。</p>
+     * <p><b>什么是 Cache-Aside（旁路缓存）模式？</b><br>
+     * 这是最经典的缓存使用模式，核心原则：
+     * 读：先读缓存，命中就返回；未命中就读数据库，把结果写入缓存再返回。
+     * 写：先更新数据库，再删除缓存（而不是更新缓存）。
+     * 为什么写时删缓存而不是更新缓存？因为如果两个写请求并发，
+     * 可能出现"后写的先更新缓存、先写的后更新缓存"导致缓存里是旧值。
+     * 删缓存更简单安全——下次读的时候自然会加载最新数据。</p>
      *
-     * <p><b>为什么返回 ProductVO 而不是 Product？</b><br>
-     * Product 实体里只有 sellerId（数字），没有卖家昵称和头像。
-     * 前端展示商品详情时需要显示"谁在卖"，所以需要再查一次 User 表，
-     * 把卖家的昵称和头像拼到 VO 里一起返回。</p>
+     * <p><b>什么是缓存穿透？如何防御？</b><br>
+     * 攻击者故意请求不存在的商品 ID（如 -1、999999999），
+     * 缓存里永远没有，每次都会穿透到 MySQL，造成数据库压力。
+     * 防御方法：查不到数据时，在 Redis 中存一个 "NULL" 标记（短过期时间），
+     * 下次再请求同一个 ID 时，看到 "NULL" 就知道商品不存在，直接返回错误，不再查 MySQL。</p>
+     *
+     * <p><b>什么是缓存雪崩？如何防御？</b><br>
+     * 如果大量缓存同时过期，所有请求瞬间涌向 MySQL，数据库可能被打垮。
+     * 防御方法：给每个缓存的过期时间加一个随机偏移（0~10分钟），
+     * 这样不同商品的缓存会在不同时间过期，请求被分散，不会形成洪峰。</p>
+     *
+     * <p><b>浏览量为什么用原子 SQL 而不是先查再改？</b><br>
+     * 直接写 SQL（SET view_count = view_count + 1）是数据库层面的原子操作，
+     * MySQL 行锁保证并发安全。如果用"查出来 → Java 里 +1 → 存回去"，
+     * 两个线程同时读到 100，各 +1 写回 101，实际应该是 102——丢失了一次计数。
+     * 校园平台并发不高，但养成原子操作的习惯很重要。</p>
      *
      * @param id 商品 ID
      * @return 包含卖家信息的商品视图对象
@@ -244,23 +306,87 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
     @Override
     public ProductVO getProductById(Long id) {
         log.info("查询商品详情：productId={}", id);
-        // 1. 查商品
+
+        // ===== 第 1 步：尝试从 Redis 缓存读取 =====
+        // 缓存 Key 格式：product:detail:{id}，例如 product:detail:101
+        String cacheKey = RedisConstants.PRODUCT_DETAIL_KEY + id;
+        String cachedJson = stringRedisTemplate.opsForValue().get(cacheKey);
+
+        if (cachedJson != null) {
+            // 缓存命中！不需要查 MySQL 了
+
+            // 1a. 检查是否是空值标记（防缓存穿透）
+            //     如果之前查过这个 ID 但商品不存在，Redis 里存的是 "NULL" 字符串
+            if (RedisConstants.PRODUCT_NULL_VALUE.equals(cachedJson)) {
+                log.debug("商品详情缓存命中（空值标记）：productId={}", id);
+                throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
+            }
+
+            // 1b. 反序列化：把 JSON 字符串还原为 ProductVO 对象
+            try {
+                ProductVO vo = objectMapper.readValue(cachedJson, ProductVO.class);
+                log.debug("商品详情缓存命中：productId={}", id);
+
+                // 浏览量仍然要 +1（缓存命中不代表不需要计数）
+                // 注意：缓存中的 viewCount 是写入缓存那一刻的值，不是实时的，
+                // 这对校园平台完全可以接受，浏览量本身就不需要精确到个位
+                incrementViewCount(id);
+
+                return vo;
+            } catch (Exception e) {
+                // 1c. JSON 解析失败（可能是缓存数据损坏、格式变更等异常情况）
+                //     删除这条坏缓存，走下面的 MySQL 查询逻辑重新加载
+                log.warn("商品详情缓存解析失败，删除坏缓存：productId={}", id);
+                stringRedisTemplate.delete(cacheKey);
+            }
+        }
+
+        // ===== 第 2 步：缓存未命中，查询 MySQL 数据库 =====
         Product product = this.getById(id);
+
+        // ===== 第 3 步：数据库也查不到 → 缓存空值 + 抛异常 =====
         if (product == null) {
+            // 缓存空值（防穿透）：存入 "NULL" 标记，过期时间较短（5分钟）
+            // 这样短时间内重复请求同一个不存在的 ID，不会再穿透到 MySQL
+            stringRedisTemplate.opsForValue().set(
+                    cacheKey,
+                    RedisConstants.PRODUCT_NULL_VALUE,
+                    Duration.ofMinutes(RedisConstants.PRODUCT_NULL_TTL)
+            );
+            log.info("商品不存在，缓存空值防穿透：productId={}", id);
             throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
         }
 
-        // 2. 浏览量 +1（简单写法：查出当前值，在 Java 中加 1，写回数据库）
-        product.setViewCount(product.getViewCount() + 1);
-        this.updateById(product);
+        // ===== 第 4 步：浏览量 +1（原子操作）=====
+        incrementViewCount(id);
 
-        // 3. 根据 sellerId 查卖家信息（昵称、头像）
-        //    userMapper 是本类注入的 UserMapper，直接调用 selectById
+        // ===== 第 5 步：查询卖家信息，组装 VO =====
         User seller = userMapper.selectById(product.getSellerId());
+        ProductVO vo = convertToProductVO(product, seller);
 
-        // 4. 把 Product 实体 + User 实体拼成 ProductVO 返回给前端
-        log.info("查询商品详情成功：productId={}, viewCount={}", id, product.getViewCount());
-        return convertToProductVO(product, seller);
+        // ===== 第 6 步：写入 Redis 缓存 =====
+        // 过期时间 = 基础时间(30分钟) + 随机偏移(0~9分钟)
+        // 随机偏移防止缓存雪崩：不同商品的缓存不会在同一时刻集体过期
+        //
+        // 为什么用 ThreadLocalRandom 而不是 new Random()？
+        // new Random() 每次调用都创建新对象（浪费内存），且多线程下内部用 CAS 竞争种子（性能差）。
+        // ThreadLocalRandom 是 Java 7+ 推荐的方式：每个线程有自己的随机数生成器，
+        // 无竞争、无对象创建，并发性能远优于 Random。
+        long ttl = RedisConstants.PRODUCT_DETAIL_TTL + ThreadLocalRandom.current().nextInt(10);
+
+        try {
+            // 序列化：把 ProductVO 对象转成 JSON 字符串存入 Redis
+            String json = objectMapper.writeValueAsString(vo);
+            // 注意：这里用 Duration.ofMinutes()，因为 TTL 常量的单位是分钟
+            stringRedisTemplate.opsForValue().set(cacheKey, json, Duration.ofMinutes(ttl));
+            log.info("商品详情写入缓存：productId={}, ttl={}分钟", id, ttl);
+        } catch (Exception e) {
+            // 缓存写入失败不影响正常业务（降级为每次查 MySQL），只记录警告日志
+            // 不能因为 Redis 故障就让整个商品详情接口不可用
+            log.warn("商品详情缓存写入失败（不影响正常返回）：productId={}", id, e);
+        }
+
+        return vo;
     }
 
     // ==================== 商品列表（分页 + 筛选 + 排序）====================
@@ -405,22 +531,25 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         return voPage;
     }
 
-    // ==================== 修改商品状态（上架/下架/标记已售）====================
+    // ==================== 修改商品状态（上架/下架）====================
 
     /**
-     * 修改商品状态
+     * 修改商品状态（仅支持上架/下架切换）
      *
-     * <p>状态值含义：0=下架（不在列表中显示）、1=在售（正常显示）、2=已售（交易完成）</p>
+     * <p>状态值含义：0=下架（不在列表中显示）、1=在售（正常显示）</p>
      *
      * <p>使用场景：</p>
      * <ul>
      *   <li>卖家主动下架 → status=0</li>
      *   <li>卖家重新上架 → status=1</li>
-     *   <li>交易完成后标记已售 → status=2</li>
      * </ul>
      *
+     * <p><b>注意：</b>此接口只允许设置 0（下架）和 1（上架）。
+     * "已售"状态（status=3）由订单确认流程自动设置，不允许卖家手动标记，
+     * 防止卖家在没有真实交易的情况下把商品标记为已售来逃避交易。</p>
+     *
      * @param id     商品 ID
-     * @param status 新状态值（0/1/2）
+     * @param status 新状态值（0=下架 / 1=上架）
      */
     @Override
     public void updateStatus(Long id, Integer status) {
@@ -434,7 +563,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 2. 校验权限：只有本人能改自己商品的状态
         checkOwnership(product);
 
-        // 3. 校验状态值合法性（防止前端传一个 99 之类的无效值）
+        // 3. 校验状态值合法性（只允许上架和下架，防止前端传无效值）
         if (status == null || (status != ProductStatus.OFF_SALE && status != ProductStatus.ON_SALE)) {
             throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "只能设置为上架或下架");
         }
@@ -442,6 +571,11 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 4. 更新状态并写回数据库
         product.setStatus(status);
         this.updateById(product);
+
+        // 5. 清除缓存：状态变了（上架/下架），缓存必须失效
+        //    否则商品下架后，用户通过缓存还能看到它
+        evictProductCache(id);
+
         log.info("修改商品状态成功：productId={}, status={}", id, status);
     }
 
@@ -527,6 +661,35 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
     }
 
     /**
+     * 清除指定商品的 Redis 缓存
+     *
+     * <p><b>什么时候调用？</b><br>
+     * 在商品数据发生变化的操作之后调用：修改商品、删除商品、修改状态。
+     * 这是 Cache-Aside 模式中"写后失效"的核心——数据变了就删缓存，
+     * 下次读取时自然会从 MySQL 加载最新数据并重建缓存。</p>
+     *
+     * <p><b>为什么删除缓存而不是更新缓存？</b><br>
+     * 1. 删除比更新简单，不需要重新组装 VO（可能还要查卖家信息）
+     * 2. 避免并发写导致的缓存不一致问题
+     * 3. 如果商品被删除了，更新缓存没有意义
+     * 4. 懒加载思想：只有真正被访问时才重建缓存，节省资源</p>
+     *
+     * <p><b>删除失败怎么办？</b><br>
+     * 这里没有 try-catch，如果 Redis 连接异常会抛出异常。
+     * 在实际生产中可以选择 catch 后只记日志（降级为缓存过期后自然失效），
+     * 但对于校园项目，让异常暴露出来更容易发现问题。</p>
+     *
+     * @param productId 要清除缓存的商品 ID
+     */
+    private void evictProductCache(Long productId) {
+        String cacheKey = RedisConstants.PRODUCT_DETAIL_KEY + productId;
+        Boolean deleted = stringRedisTemplate.delete(cacheKey);
+        if (Boolean.TRUE.equals(deleted)) {
+            log.debug("已清除商品缓存：productId={}", productId);
+        }
+    }
+
+    /**
      * 实体转 VO（Product + User → ProductVO）
      *
      * <p><b>为什么需要转换？</b><br>
@@ -565,5 +728,43 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         }
 
         return vo;
+    }
+
+    /**
+     * 增加商品浏览量（原子操作，避免并发计数错误）
+     *
+     * <p><b>为什么要用这个写法，而不是先 SELECT 再 UPDATE？</b></p>
+     * <pre>{@code
+     * // ❌ 新手容易写成的方式（有并发问题）：
+     * Product product = this.getById(id);               // 1. 先查出来
+     * product.setViewCount(product.getViewCount() + 1); // 2. 内存中+1
+     * this.updateById(product);                         // 3. 再写回去
+     *
+     * // 问题：两个线程同时读到 viewCount=100，各+1写回101，实际应该是102
+     * // 这叫"读-改-写"竞态条件（Race Condition）
+     *
+     * // ✅ 本方法的写法（原子操作）：
+     * // UPDATE product SET view_count = view_count + 1 WHERE id = ?
+     * // MySQL 行锁保证同一时刻只有一个线程能更新这行，+1 不会被覆盖
+     * }</pre>
+     *
+     * <p><b>方法调用链逐层解释：</b></p>
+     * <ul>
+     *   <li><b>this.lambdaUpdate()</b> —— MyBatis-Plus 的 Lambda 更新链式操作入口，
+     *       返回 LambdaUpdateChainWrapper，允许用点号连接条件和方法</li>
+     *   <li><b>.eq(Product::getId, id)</b> —— 生成 WHERE id = ?（eq = equal）</li>
+     *   <li><b>.setSql("view_count = view_count + 1")</b> —— 在 SET 子句嵌入原始 SQL。
+     *       不能用 .set(Product::getViewCount, xxx) 因为那只能赋固定值，
+     *       无法表达"在原值基础上+1"。setSql 让数据库自己计算，保证原子性</li>
+     *   <li><b>.update()</b> —— 执行 UPDATE，返回是否成功</li>
+     * </ul>
+     *
+     * @param id 商品 ID（主键）
+     */
+    private void incrementViewCount(Long id) {
+        this.lambdaUpdate()                 // 创建 Lambda 更新链
+            .eq(Product::getId, id)         // WHERE id = ?
+            .setSql("view_count = view_count + 1") // SET view_count = view_count + 1（原子自增）
+            .update();                      // 执行 UPDATE
     }
 }
