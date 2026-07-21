@@ -68,6 +68,7 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 @Service
+@SuppressWarnings("null") // 抑制 MyBatis-Plus Lambda 方法引用与空类型分析冲突的误报警告
 public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> implements ProductService {
 
     /**
@@ -305,12 +306,23 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
      */
     @Override
     public ProductVO getProductById(Long id) {
-        log.info("查询商品详情：productId={}", id);
+        log.debug("查询商品详情：productId={}", id);
 
         // ===== 第 1 步：尝试从 Redis 缓存读取 =====
         // 缓存 Key 格式：product:detail:{id}，例如 product:detail:101
         String cacheKey = RedisConstants.PRODUCT_DETAIL_KEY + id;
-        String cachedJson = stringRedisTemplate.opsForValue().get(cacheKey);
+
+        // 为什么 Redis 读取也要 try-catch？
+        // Redis 是外部服务，可能因为重启、网络抖动、内存满等原因连接失败。
+        // 如果这里不加保护，Redis 一挂整个商品详情接口就返回 500——
+        // 但 MySQL 里数据是完好的，用户本可以正常浏览。
+        // 降级策略：Redis 异常时当作"缓存未命中"，直接走 MySQL 查询，保证接口可用。
+        String cachedJson = null;
+        try {
+            cachedJson = stringRedisTemplate.opsForValue().get(cacheKey);
+        } catch (Exception e) {
+            log.warn("Redis 读取异常，降级为查询 MySQL：productId={}", id, e);
+        }
 
         if (cachedJson != null) {
             // 缓存命中！不需要查 MySQL 了
@@ -675,17 +687,26 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
      * 4. 懒加载思想：只有真正被访问时才重建缓存，节省资源</p>
      *
      * <p><b>删除失败怎么办？</b><br>
-     * 这里没有 try-catch，如果 Redis 连接异常会抛出异常。
-     * 在实际生产中可以选择 catch 后只记日志（降级为缓存过期后自然失效），
-     * 但对于校园项目，让异常暴露出来更容易发现问题。</p>
+     * 用 try-catch 包裹，Redis 异常时只记警告日志，不向上抛出。
+     * 原因：调用此方法时 MySQL 的写操作已经成功完成了，
+     * 如果因为删缓存失败就抛异常，用户会收到 500 错误——
+     * 但数据其实已经改好了，用户可能以为操作失败而重复提交。
+     * 最坏情况：缓存多活一段时间（最多 30+9 分钟），过期后自然失效，
+     * 下次读取时会从 MySQL 加载最新数据重建缓存。</p>
      *
      * @param productId 要清除缓存的商品 ID
      */
     private void evictProductCache(Long productId) {
-        String cacheKey = RedisConstants.PRODUCT_DETAIL_KEY + productId;
-        Boolean deleted = stringRedisTemplate.delete(cacheKey);
-        if (Boolean.TRUE.equals(deleted)) {
-            log.debug("已清除商品缓存：productId={}", productId);
+        try {
+            String cacheKey = RedisConstants.PRODUCT_DETAIL_KEY + productId;
+            Boolean deleted = stringRedisTemplate.delete(cacheKey);
+            if (Boolean.TRUE.equals(deleted)) {
+                log.debug("已清除商品缓存：productId={}", productId);
+            }
+        } catch (Exception e) {
+            // Redis 异常不影响业务主流程：MySQL 数据已经更新成功，
+            // 缓存最迟在 TTL 到期后自然失效，不会造成永久数据不一致
+            log.warn("清除商品缓存失败（不影响数据正确性，缓存将自然过期）：productId={}", productId, e);
         }
     }
 
