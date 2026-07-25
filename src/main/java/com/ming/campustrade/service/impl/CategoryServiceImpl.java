@@ -49,6 +49,7 @@ import com.ming.campustrade.vo.CategoryVO;
  */
 @Slf4j
 @Service
+@SuppressWarnings("null") // 抑制 MyBatis-Plus Lambda 方法引用与空类型分析冲突的误报警告
 public class CategoryServiceImpl extends ServiceImpl<CategoryMapper, Category> implements CategoryService {
 
     // ==================== 添加分类 ====================

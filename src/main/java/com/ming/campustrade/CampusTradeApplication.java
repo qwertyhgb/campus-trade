@@ -2,6 +2,7 @@ package com.ming.campustrade;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * 校园二手交易系统（Campus Trade）的 Spring Boot 启动类。
@@ -23,9 +24,15 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * <p>正因为 {@code @ComponentScan} 默认以启动类所在包为根，所以启动类必须放在所有业务代码的
  * 父包（这里是 {@code com.ming.campustrade}）下，否则子包中的组件会扫描不到。</p>
  *
+ * <p>{@link EnableScheduling} —— 开启 Spring 的定时任务调度能力。
+ * 加上此注解后，Spring 会自动检测容器中所有带有 {@code @Scheduled} 注解的方法，
+ * 并在应用启动后按 cron 表达式/固定频率自动调度它们执行。
+ * 适用于定时清理过期数据、刷新缓存、生成统计报表等后台周期性任务。</p>
+ *
  * @author ming
  */
 @SpringBootApplication
+@EnableScheduling
 public class CampusTradeApplication {
 
     /**

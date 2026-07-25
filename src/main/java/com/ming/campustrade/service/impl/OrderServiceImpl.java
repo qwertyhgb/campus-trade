@@ -351,6 +351,76 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
 
         return voPage;
     }
+
+    // ==================== 管理员：全部订单 ====================
+
+    /**
+     * 管理员分页查询平台全部订单（可按状态筛选）
+     *
+     * <p><b>和 getBuyOrder/getSellOrder 的区别：</b></p>
+     * <ul>
+     *   <li>getBuyOrder/getSellOrder：面向普通用户，只查自己作为买家/卖家的订单</li>
+     *   <li>listOrdersForAdmin：面向管理员，查平台全部订单，不限买卖方，支持按状态筛选</li>
+     * </ul>
+     *
+     * <p><b>性能优化：</b>与买家/卖家订单列表一样，采用批量查询避免 N+1：
+     * 先收集当前页所有不重复的买家 ID 和卖家 ID，各发一次 selectByIds 批量查出，
+     * 再转成 Map 供 O(1) 查找。</p>
+     *
+     * @param status   订单状态筛选（null 表示查全部状态）
+     * @param pageNo   页码
+     * @param pageSize 每页条数
+     * @return 分页结果
+     */
+    @Override
+    public IPage<OrderVO> listOrdersForAdmin(Integer status, Integer pageNo, Integer pageSize) {
+        log.info("管理员查询全部订单：status={}, pageNo={}, pageSize={}", status, pageNo, pageSize);
+
+        // 1. 构建查询条件：可选状态筛选 + 按创建时间倒序
+        LambdaQueryWrapper<Order> wrapper = new LambdaQueryWrapper<>();
+        if (status != null) {
+            wrapper.eq(Order::getStatus, status);
+        }
+        wrapper.orderByDesc(Order::getCreateTime);
+
+        // 2. 分页查询
+        Page<Order> page = new Page<>(pageNo, pageSize);
+        Page<Order> orderPage = this.page(page, wrapper);
+
+        // 3. 收集当前页所有不重复的买家 ID 和卖家 ID
+        List<Long> buyerIds = orderPage.getRecords().stream()
+                .map(Order::getBuyerId)
+                .distinct()
+                .toList();
+        List<Long> sellerIds = orderPage.getRecords().stream()
+                .map(Order::getSellerId)
+                .distinct()
+                .toList();
+
+        // 4. 批量查询买家和卖家信息，转成 Map 供后续快速查找
+        Map<Long, User> buyerMap = buyerIds.isEmpty() ? Map.of()
+                : userMapper.selectByIds(buyerIds).stream()
+                        .collect(Collectors.toMap(User::getId, u -> u));
+        Map<Long, User> sellerMap = sellerIds.isEmpty() ? Map.of()
+                : userMapper.selectByIds(sellerIds).stream()
+                        .collect(Collectors.toMap(User::getId, u -> u));
+
+        // 5. 转换为 VO 列表（从两个 Map 中分别取买家/卖家信息）
+        List<OrderVO> voList = orderPage.getRecords().stream()
+                .map(order -> convertOrderVO(order,
+                        buyerMap.get(order.getBuyerId()),
+                        sellerMap.get(order.getSellerId())))
+                .toList();
+
+        // 6. 装填分页对象并返回
+        Page<OrderVO> voPage = new Page<>();
+        voPage.setRecords(voList);
+        voPage.setTotal(orderPage.getTotal());
+        voPage.setCurrent(orderPage.getCurrent());
+        voPage.setSize(orderPage.getSize());
+
+        return voPage;
+    }
     
     /**
      * 内部辅助工具方法：将数据库实体（Entity）对象转换为传输视图（VO）对象

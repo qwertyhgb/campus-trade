@@ -52,8 +52,11 @@ public class ProductVO {
     /** 成色等级：0=全新，1=几乎全新，2=轻微使用，3=明显使用。 */
     private Integer conditionLevel;
 
-    /** 商品状态：0=下架，1=在售，2=锁定，3=已售。 */
+    /** 商品状态：0=下架，1=在售，2=锁定，3=已售，4=待审核。 */
     private Integer status;
+
+    /** 审核备注（审核驳回原因，审核通过时为空）。 */
+    private String reviewRemark;
 
     /** 浏览次数。 */
     private Integer viewCount;

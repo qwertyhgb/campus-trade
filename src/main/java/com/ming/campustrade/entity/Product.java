@@ -97,6 +97,14 @@ public class Product {
     private Integer viewCount;
 
     /**
+     * 审核备注（审核驳回原因）。
+     *
+     * <p>管理员审核商品时填写：审核通过可为空，审核驳回时记录驳回原因，
+     * 卖家可在"我的商品"中看到自己的商品为何被驳回，便于修改后重新提交。</p>
+     */
+    private String reviewRemark;
+
+    /**
      * 商品发布时间，使用 {@link LocalDateTime}（线程安全、API 友好）。
      */
     private LocalDateTime createTime;

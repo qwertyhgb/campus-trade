@@ -21,7 +21,7 @@ import lombok.Getter;
  *
  * 工作流程：
  * 1. Service 层检测到业务规则被违反
- * 2. 抛出 new BusinessException(ResultCode.XXX) 或 new BusinessException(ResultCode.XXX, "自定义消息")
+ * 2. 抛出 new BusinessException(ResultCode.PRODUCT_NOT_FOUND) 或 new BusinessException(ResultCode.PRODUCT_NOT_FOUND, "自定义消息")
  * 3. 异常向上传播，被 GlobalExceptionHandler 中的 @ExceptionHandler(BusinessException.class) 捕获
  * 4. 处理器将异常中的 code 和 message 封装为 Result 对象返回给前端
  * 5. 前端根据 code 判断失败，展示 message 给用户

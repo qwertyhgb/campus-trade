@@ -5,6 +5,8 @@ import com.ming.campustrade.common.annotation.PublicApi;
 import com.ming.campustrade.common.annotation.RequireRole;
 import com.ming.campustrade.dto.UserAddDTO;
 import com.ming.campustrade.dto.UserLoginDTO;
+import com.ming.campustrade.dto.UserPasswordUpdateDTO;
+import com.ming.campustrade.dto.UserProfileUpdateDTO;
 import com.ming.campustrade.dto.UserRegisterDTO;
 import com.ming.campustrade.service.UserService;
 import com.ming.campustrade.utils.UserHolder;
@@ -199,5 +201,46 @@ public class UserController {
         UserVO userVO = UserHolder.getUserVO();
         log.info("获取当前用户信息：userId={}, username={}", userVO.getId(), userVO.getUsername());
         return Result.success(userVO);
+    }
+
+    /**
+     * 修改个人资料（需要登录）。
+     *
+     * <p>支持部分更新：昵称、头像、手机号均为可选，只传需要修改的字段。
+     * 修改后服务端会同步更新 Redis 中的登录态，无需重新登录即可生效。</p>
+     *
+     * <p>{@code @RequestHeader("Authorization")} 从请求头提取 token，
+     * 传给 Service 层用于定位并同步 Redis 登录态（与 logout 的做法一致）。</p>
+     *
+     * @param dto   修改参数（昵称、头像、手机号，均可选）
+     * @param token 请求头中的认证令牌
+     * @return 统一响应结果（无数据体）
+     */
+    @Operation(summary = "修改个人资料", description = "修改当前登录用户的昵称、头像、手机号（部分更新），同步刷新登录态")
+    @PutMapping("/profile")
+    public Result<Void> updateProfile(@RequestBody @Valid UserProfileUpdateDTO dto,
+                                      @Parameter(description = "认证令牌") @RequestHeader("Authorization") String token) {
+        log.info("修改个人资料");
+        userService.updateProfile(dto, token);
+        log.info("修改个人资料成功");
+        return Result.success();
+    }
+
+    /**
+     * 修改密码（需要登录）。
+     *
+     * <p>需要提供旧密码进行身份核验，新密码和确认密码需一致。
+     * 修改成功后无需重新登录（当前 token 依然有效，因为 token 与密码无关）。</p>
+     *
+     * @param dto 修改密码参数（旧密码、新密码、确认密码）
+     * @return 统一响应结果（无数据体）
+     */
+    @Operation(summary = "修改密码", description = "修改当前登录用户的登录密码，需验证旧密码")
+    @PutMapping("/password")
+    public Result<Void> updatePassword(@RequestBody @Valid UserPasswordUpdateDTO dto) {
+        log.info("修改密码");
+        userService.updatePassword(dto);
+        log.info("修改密码成功");
+        return Result.success();
     }
 }

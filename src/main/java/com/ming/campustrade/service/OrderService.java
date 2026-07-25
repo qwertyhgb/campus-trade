@@ -66,4 +66,14 @@ public interface OrderService extends IService<Order> {
      * @return 分页结果，{@link IPage} 内含数据列表与总条数等分页信息
      */
     IPage<OrderVO> getSellOrder(Integer pageNo, Integer pageSize);
+
+    /**
+     * 管理员分页查询平台全部订单（可按状态筛选）。
+     *
+     * @param status   订单状态筛选（null 表示查全部状态）
+     * @param pageNo   页码
+     * @param pageSize 每页条数
+     * @return 分页结果，含买卖双方昵称等关联信息
+     */
+    IPage<OrderVO> listOrdersForAdmin(Integer status, Integer pageNo, Integer pageSize);
 }

@@ -44,4 +44,22 @@ public interface ProductService extends IService<Product> {
      * 查询我发布的所有商品
      */
     IPage<ProductVO> getMyProducts(Integer pageNo, Integer pageSize);
+
+    /**
+     * 管理员审核商品（通过上架 / 不通过下架）
+     *
+     * @param id       商品 ID
+     * @param approved true=审核通过（上架），false=审核不通过（下架）
+     * @param remark   审核备注（驳回原因，通过时可为空）
+     */
+    void reviewProduct(Long id, boolean approved, String remark);
+
+    /**
+     * 管理员查询商品列表（分页，可按状态筛选，含待审核商品）
+     *
+     * @param status   商品状态筛选（null 表示查全部状态）
+     * @param pageNo   页码
+     * @param pageSize 每页条数
+     */
+    IPage<ProductVO> listProductsForAdmin(Integer status, Integer pageNo, Integer pageSize);
 }

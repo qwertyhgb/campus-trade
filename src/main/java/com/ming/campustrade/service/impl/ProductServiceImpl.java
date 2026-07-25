@@ -12,8 +12,12 @@ import com.ming.campustrade.common.exception.BusinessException;
 import com.ming.campustrade.dto.ProductPublishDTO;
 import com.ming.campustrade.dto.ProductQueryDTO;
 import com.ming.campustrade.dto.ProductUpdateDTO;
+import com.ming.campustrade.entity.Comment;
+import com.ming.campustrade.entity.Favorite;
 import com.ming.campustrade.entity.Product;
 import com.ming.campustrade.entity.User;
+import com.ming.campustrade.mapper.CommentMapper;
+import com.ming.campustrade.mapper.FavoriteMapper;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
 import com.ming.campustrade.service.ProductService;
@@ -97,6 +101,16 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
     private final ObjectMapper objectMapper;
 
     /**
+     * 留言 Mapper，用于删除商品时清理关联的留言数据
+     */
+    private final CommentMapper commentMapper;
+
+    /**
+     * 收藏 Mapper，用于删除商品时清理关联的收藏数据
+     */
+    private final FavoriteMapper favoriteMapper;
+
+    /**
      * 构造器注入
      *
      * <p>Spring 启动时发现 ProductServiceImpl 需要这些类型的 Bean，
@@ -106,11 +120,16 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
      * @param userMapper          用户数据访问层
      * @param stringRedisTemplate Redis 操作模板
      * @param objectMapper        JSON 序列化工具
+     * @param commentMapper       留言数据访问层
+     * @param favoriteMapper      收藏数据访问层
      */
-    public ProductServiceImpl(UserMapper userMapper, StringRedisTemplate stringRedisTemplate, ObjectMapper objectMapper) {
+    public ProductServiceImpl(UserMapper userMapper, StringRedisTemplate stringRedisTemplate,
+                              ObjectMapper objectMapper, CommentMapper commentMapper, FavoriteMapper favoriteMapper) {
         this.userMapper = userMapper;
         this.stringRedisTemplate = stringRedisTemplate;
         this.objectMapper = objectMapper;
+        this.commentMapper = commentMapper;
+        this.favoriteMapper = favoriteMapper;
     }
 
     // ==================== 发布商品 ====================
@@ -124,6 +143,11 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
      * 因为 userId 来自登录拦截器验证通过的 token，是可信的。
      * 如果从请求参数传 userId，用户可以伪造（改一下请求体里的 userId 就能冒充别人发商品）。
      * 从 ThreadLocal 取则保证了 userId 一定是当前登录用户自己。</p>
+     *
+     * <p><b>为什么发布后是"待审核"而不是直接"在售"？</b><br>
+     * 校园平台需要对商品内容进行合规审核（防止违规物品、虚假信息）。
+     * 用户发布后商品进入 PENDING_REVIEW（待审核）状态，此时不会出现在商品列表中，
+     * 需管理员调用审核接口通过后才能上架（变为 ON_SALE）。</p>
      *
      * @param dto 发布请求参数（标题、价格、描述、成色等），已通过 @Valid 校验非空和格式
      */
@@ -144,13 +168,13 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         product.setCategoryId(dto.getCategoryId());
         product.setConditionLevel(dto.getConditionLevel());
         product.setSellerId(sellerId);     // 卖家 ID 来自登录态，不可伪造
-        product.setStatus(ProductStatus.ON_SALE);              // 新发布的商品默认"在售"（1=在售）
+        product.setStatus(ProductStatus.PENDING_REVIEW);       // 新发布的商品默认"待审核"（4），需管理员审核后才上架
         product.setViewCount(0);           // 初始浏览量为 0
 
         // 3. 保存到数据库
         //    this.save() 是父类 ServiceImpl 的方法，内部执行 INSERT INTO product (...) VALUES (...)
         this.save(product);
-        log.info("发布商品成功：productId={}, title={}", product.getId(), product.getTitle());
+        log.info("发布商品成功（待审核）：productId={}, title={}", product.getId(), product.getTitle());
     }
 
     // ==================== 修改商品 ====================
@@ -186,6 +210,9 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 2. 校验权限：只有商品的主人才能修改
         checkOwnership(product);
 
+        // 记录修改前的状态，用于判断编辑后是否需要重新审核
+        boolean wasOnSale = product.getStatus() != null && product.getStatus() == ProductStatus.ON_SALE;
+
         // 3. 逐个字段判断：DTO 中非空的才覆盖到实体上（部分更新）
         if (StringUtils.hasText(dto.getTitle())) {
             product.setTitle(dto.getTitle());
@@ -209,12 +236,21 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             product.setConditionLevel(dto.getConditionLevel());
         }
 
-        // 4. 写回数据库
+        // 4. 已上架的商品被编辑后，必须重新审核（防止绕过审核修改成违规内容）
+        //    商品内容变了，原来审核通过的结论不再可信，需打回待审核状态由管理员复审。
+        //    同时清空旧的审核备注（避免卖家看到上一次驳回的过时原因）。
+        if (wasOnSale) {
+            product.setStatus(ProductStatus.PENDING_REVIEW);
+            product.setReviewRemark(null);
+            log.info("商品已上架后被编辑，转为待审核状态：productId={}", id);
+        }
+
+        // 5. 写回数据库
         //    this.updateById() 内部执行 UPDATE product SET ... WHERE id=? AND deleted=0
         //    只更新实体中被 set 过的字段，未 set 的字段不会出现在 SQL 中
         this.updateById(product);
 
-        // 5. 清除 Redis 缓存（Cache-Aside 模式的"写后失效"策略）
+        // 6. 清除 Redis 缓存（Cache-Aside 模式的"写后失效"策略）
         //    商品数据变了，缓存里的旧数据必须删掉，否则用户会看到修改前的信息。
         //    下次查询时会重新从 MySQL 加载最新数据并写入缓存。
         evictProductCache(id);
@@ -254,13 +290,26 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 2. 校验权限：只有本人能删自己的商品
         checkOwnership(product);
 
-        // 3. 逻辑删除（@TableLogic 自动把 DELETE 转成 UPDATE SET deleted=1）
+        // 3. 逻辑删除商品（@TableLogic 自动把 DELETE 转成 UPDATE SET deleted=1）
         this.removeById(id);
 
-        // 4. 清除缓存：商品已删除，缓存必须失效，否则用户还能看到已删除的商品
+        // 4. 清理关联数据，避免产生"孤儿数据"
+        //    商品删除后，它下面的留言和收藏若不清理会变成无主数据，
+        //    既浪费存储，又可能在"我的收藏"等列表里查出已删除的商品。
+        //    - 留言（Comment 有 @TableLogic）：delete 会被改写成逻辑删除 UPDATE SET deleted=1
+        //    - 收藏（Favorite 无 @TableLogic）：delete 是真正的物理删除
+        LambdaQueryWrapper<Comment> commentWrapper = new LambdaQueryWrapper<>();
+        commentWrapper.eq(Comment::getProductId, id);
+        int deletedComments = commentMapper.delete(commentWrapper);
+
+        LambdaQueryWrapper<Favorite> favoriteWrapper = new LambdaQueryWrapper<>();
+        favoriteWrapper.eq(Favorite::getProductId, id);
+        int deletedFavorites = favoriteMapper.delete(favoriteWrapper);
+
+        // 5. 清除缓存：商品已删除，缓存必须失效，否则用户还能看到已删除的商品
         evictProductCache(id);
 
-        log.info("删除商品成功：productId={}", id);
+        log.info("删除商品成功：productId={}, 同步清理留言{}条、收藏{}条", id, deletedComments, deletedFavorites);
     }
 
     // ==================== 查看商品详情（带 Redis 缓存）====================
@@ -644,6 +693,108 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         return voPage;
     }
 
+    // ==================== 管理员：审核商品 ====================
+
+    /**
+     * 管理员审核商品（通过上架 / 不通过下架）
+     *
+     * <p><b>流程：</b>查商品是否存在 → 校验是否为待审核状态 → 根据审核结果设置状态 → 写库 → 清缓存</p>
+     *
+     * <p><b>为什么要校验“是否为待审核状态”？</b><br>
+     * 只有 PENDING_REVIEW 状态的商品才需要审核。如果商品已被审核过（在售/下架）、
+     * 或已售出/锁定，都不应该再被审核操作。用条件更新（WHERE status = PENDING_REVIEW）
+     * 还能防止两个管理员同时审核同一商品时的并发问题。</p>
+     *
+     * @param id       商品 ID
+     * @param approved true=审核通过（上架），false=审核不通过（下架）
+     * @param remark   审核备注（驳回原因，通过时可为空）
+     */
+    @Override
+    public void reviewProduct(Long id, boolean approved, String remark) {
+        log.info("管理员审核商品：productId={}, approved={}", id, approved);
+
+        // 1. 查商品是否存在
+        Product product = this.getById(id);
+        if (product == null) {
+            throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
+        }
+
+        // 2. 校验状态：只有待审核的商品才能被审核
+        if (product.getStatus() != ProductStatus.PENDING_REVIEW) {
+            throw new BusinessException(ResultCode.PRODUCT_NOT_PENDING_REVIEW);
+        }
+
+        // 3. 根据审核结果设置状态：通过 → 上架，不通过 → 下架
+        int newStatus = approved ? ProductStatus.ON_SALE : ProductStatus.OFF_SALE;
+        product.setStatus(newStatus);
+
+        // 4. 记录审核备注：驳回时保存原因（卖家可见），通过时清空备注
+        //     StringUtils.hasText 判断：驳回但没填原因时存空字符串，避免残留上一次驳回的旧原因
+        product.setReviewRemark(approved ? null : (StringUtils.hasText(remark) ? remark : ""));
+        this.updateById(product);
+
+        // 5. 清除缓存（状态变了，缓存必须失效）
+        evictProductCache(id);
+
+        log.info("审核商品完成：productId={}, 结果={}", id, approved ? "通过上架" : "不通过下架");
+    }
+
+    // ==================== 管理员：商品列表 ====================
+
+    /**
+     * 管理员查询商品列表（分页，可按状态筛选，含待审核商品）
+     *
+     * <p><b>和 listProducts 的区别：</b></p>
+     * <ul>
+     *   <li>listProducts：面向买家，只查在售商品（status=1）</li>
+     *   <li>listProductsForAdmin：面向管理员，可查任意状态的商品（含待审核），支持按状态筛选</li>
+     * </ul>
+     *
+     * @param status   商品状态筛选（null 表示查全部状态）
+     * @param pageNo   页码
+     * @param pageSize 每页条数
+     * @return 分页结果
+     */
+    @Override
+    public IPage<ProductVO> listProductsForAdmin(Integer status, Integer pageNo, Integer pageSize) {
+        log.info("管理员查询商品列表：status={}, pageNo={}, pageSize={}", status, pageNo, pageSize);
+
+        // 1. 构建查询条件：可选状态筛选 + 按发布时间倒序
+        LambdaQueryWrapper<Product> wrapper = new LambdaQueryWrapper<>();
+        if (status != null) {
+            wrapper.eq(Product::getStatus, status);
+        }
+        wrapper.orderByDesc(Product::getCreateTime);
+
+        // 2. 分页查询
+        Page<Product> page = new Page<>(pageNo, pageSize);
+        Page<Product> productPage = this.page(page, wrapper);
+
+        // 3. 批量查询卖家信息（避免 N+1，与 listProducts 同样的优化思路）
+        List<Long> sellerIds = productPage.getRecords().stream()
+                .map(Product::getSellerId)
+                .distinct()
+                .toList();
+        Map<Long, User> sellerMap = sellerIds.isEmpty()
+                ? Map.of()
+                : userMapper.selectByIds(sellerIds).stream()
+                        .collect(Collectors.toMap(User::getId, u -> u));
+
+        // 4. 转换为 VO 列表
+        List<ProductVO> voList = productPage.getRecords().stream()
+                .map(product -> convertToProductVO(product, sellerMap.get(product.getSellerId())))
+                .toList();
+
+        // 5. 组装分页返回对象
+        Page<ProductVO> voPage = new Page<>();
+        voPage.setRecords(voList);
+        voPage.setTotal(productPage.getTotal());
+        voPage.setCurrent(productPage.getCurrent());
+        voPage.setSize(productPage.getSize());
+
+        return voPage;
+    }
+
     // ==================== 私有辅助方法 ====================
 
     /**
@@ -738,6 +889,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         vo.setCategoryId(product.getCategoryId());
         vo.setConditionLevel(product.getConditionLevel());
         vo.setStatus(product.getStatus());
+        vo.setReviewRemark(product.getReviewRemark());
         vo.setViewCount(product.getViewCount());
         vo.setCreateTime(product.getCreateTime());
 

@@ -10,13 +10,20 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.ming.campustrade.common.constant.ProductStatus;
 import com.ming.campustrade.dto.UserAddDTO;
 import com.ming.campustrade.dto.UserLoginDTO;
+import com.ming.campustrade.dto.UserPasswordUpdateDTO;
+import com.ming.campustrade.dto.UserProfileUpdateDTO;
 import com.ming.campustrade.dto.UserRegisterDTO;
+import com.ming.campustrade.entity.Product;
 import com.ming.campustrade.entity.User;
+import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
 import com.ming.campustrade.service.UserService;
+import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.UserVO;
 
 import java.time.Duration;
@@ -65,6 +72,7 @@ import lombok.extern.slf4j.Slf4j;
  */
 @Service
 @Slf4j
+@SuppressWarnings("null") // 抑制 MyBatis-Plus Lambda 方法引用与空类型分析冲突的误报警告
 public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements UserService {
 
     /**
@@ -92,9 +100,14 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     private final StringRedisTemplate stringRedisTemplate;
 
     /**
+     * 商品 Mapper，用于封禁用户时同步下架其在售商品
+     */
+    private final ProductMapper productMapper;
+
+    /**
      * 构造器注入
      *
-     * <p>Spring 启动时发现 UserServiceImpl 需要 StringRedisTemplate 和 BCryptPasswordEncoder，
+     * <p>Spring 启动时发现 UserServiceImpl 需要这些类型的 Bean，
      * 会自动去容器里找到对应的 Bean 并传入。
      * 这就是"构造器注入"——比 @Autowired 字段注入更推荐的方式：
      * 1. 依赖关系一目了然（看构造器参数就知道依赖了什么）；
@@ -103,10 +116,13 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      *
      * @param redisTemplate   Redis 操作模板
      * @param passwordEncoder BCrypt 密码加密器
+     * @param productMapper   商品数据访问层
      */
-    public UserServiceImpl(StringRedisTemplate redisTemplate, BCryptPasswordEncoder passwordEncoder) {
+    public UserServiceImpl(StringRedisTemplate redisTemplate, BCryptPasswordEncoder passwordEncoder,
+                           ProductMapper productMapper) {
         this.stringRedisTemplate = Objects.requireNonNull(redisTemplate, "redisTemplate 不能为 null");
         this.passwordEncoder = Objects.requireNonNull(passwordEncoder, "passwordEncoder 不能为 null");
+        this.productMapper = Objects.requireNonNull(productMapper, "productMapper 不能为 null");
     }
 
     // ==================== 管理员：查询所有用户 ====================
@@ -428,6 +444,269 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             throw new BusinessException(ResultCode.UNAUTHORIZED, "未登录或登录已过期");
         }
         log.info("用户退出登录成功");
+    }
+
+    /**
+     * 修改个人资料（昵称、头像、手机号，部分更新）
+     *
+     * <p><b>整体流程（4 步）：</b></p>
+     * <ol>
+     *   <li>从 ThreadLocal 获取当前登录用户 ID，查出用户实体</li>
+     *   <li>部分更新：DTO 中非空的字段才覆盖到实体（未传的保持原值）</li>
+     *   <li>写回数据库</li>
+     *   <li><b>同步更新登录态</b>：刷新 ThreadLocal + Redis Hash，保证后续请求读到新资料</li>
+     * </ol>
+     *
+     * <p><b>为什么要同步更新 Redis 登录态？（关键）</b><br>
+     * 本项目的登录态存在 Redis Hash 中（login 时写入）。每次请求，LoginInterceptor
+     * 都是从 Redis 读取用户信息放进 ThreadLocal。如果只改了数据库和 ThreadLocal，
+     * 而不改 Redis，那么本次请求结束后 ThreadLocal 被清理，下次请求拦截器从 Redis
+     * 读到的还是旧昵称/旧头像——用户会发现自己"改了等于没改"。
+     * 所以必须把变更同步到 Redis Hash，登录态才与数据库保持一致。</p>
+     *
+     * <p><b>什么是"部分更新"？</b><br>
+     * 前端可能只改了头像，没传昵称和手机号。DTO 中所有字段都是可选的，
+     * 这里逐个判断：字段有值才覆盖，为 null/空就跳过保持原值，
+     * 避免把用户没传的字段误置为 null。</p>
+     *
+     * @param dto   修改参数（所有字段可选，部分更新）
+     * @param token 当前登录令牌（用于定位 Redis 中的登录态并同步更新）
+     * @throws BusinessException 用户不存在时抛出 USER_NOT_FOUND
+     */
+    @Override
+    public void updateProfile(UserProfileUpdateDTO dto, String token) {
+        // ===== 第 1 步：获取当前登录用户并查出实体 =====
+        // 从 ThreadLocal 拿用户 ID（由拦截器注入，不可伪造），而不是从参数传，防止越权改别人资料
+        Long userId = UserHolder.getUserVO().getId();
+        log.info("修改个人资料：userId={}", userId);
+
+        // 根据 ID 查用户（MyBatis-Plus 自动加 WHERE deleted=0，已删除的查不到）
+        User existUser = this.getById(userId);
+        if (existUser == null) {
+            log.warn("修改个人资料失败，用户不存在：userId={}", userId);
+            throw new BusinessException(ResultCode.USER_NOT_FOUND);
+        }
+
+        // ===== 第 2 步：部分更新（非空才覆盖）=====
+        // String 用 StringUtils.hasText() 判空：排除 null、""、纯空白，比 != null 更严格
+        if (StringUtils.hasText(dto.getAvatar())) {
+            existUser.setAvatar(dto.getAvatar());
+        }
+        if (StringUtils.hasText(dto.getNickname())) {
+            existUser.setNickname(dto.getNickname());
+        }
+        // phone 允许传空字符串表示"清空手机号"，所以只用 != null 判断（不强制 hasText）
+        if (dto.getPhone() != null) {
+            existUser.setPhone(dto.getPhone());
+        }
+
+        // ===== 第 3 步：写回数据库 =====
+        // updateById 只更新实体中被 set 过的字段，未改动的字段不会出现在 SQL 中
+        this.updateById(existUser);
+        log.info("修改个人资料成功（已写库）：userId={}, nickname={}", userId, existUser.getNickname());
+
+        // ===== 第 4 步：同步更新登录态（ThreadLocal + Redis）=====
+        // 4.1 刷新 ThreadLocal：让本次请求后续逻辑（如返回给前端的 /user/me）能立即拿到新资料
+        UserVO currentUser = UserHolder.getUserVO();
+        currentUser.setNickname(existUser.getNickname());
+        currentUser.setAvatar(existUser.getAvatar());
+        currentUser.setPhone(existUser.getPhone());
+
+        // 4.2 同步 Redis Hash：保证下次请求拦截器读到的也是最新资料
+        refreshLoginUserInRedis(token, existUser);
+    }
+
+    /**
+     * 把最新的用户资料同步到 Redis 登录态 Hash 中
+     *
+     * <p><b>为什么抽成独立方法？</b><br>
+     * "更新 Redis 登录态"是一段有独立职责的逻辑（去 Bearer 前缀、拼 key、逐字段 HSET），
+     * 抽出来后 updateProfile 主流程更清晰，以后若新增"修改手机号需同步登录态"等场景也能复用。</p>
+     *
+     * <p><b>为什么用 try-catch 包裹？</b><br>
+     * 执行到这里时数据库已经更新成功了。Redis 是外部服务，可能因重启、网络抖动等暂时不可用。
+     * 如果因为同步 Redis 失败就抛异常，用户会收到 500 错误，以为资料没改成功而重复提交——
+     * 但数据库其实已经改好了。所以这里降级处理：Redis 异常只记警告日志，不影响主流程。
+     * 最坏情况：登录态 temporarily 仍是旧资料，用户重新登录一次即可刷新。</p>
+     *
+     * @param token 当前登录令牌（可能带 "Bearer " 前缀）
+     * @param user  已更新的用户实体（从中取最新的昵称/头像/手机号）
+     */
+    private void refreshLoginUserInRedis(String token, User user) {
+        try {
+            // 去掉 "Bearer " 前缀（与 logout 的处理保持一致），兼容前端两种传法
+            if (StringUtils.hasText(token) && token.startsWith("Bearer ")) {
+                token = token.substring(7);
+            }
+            String tokenKey = RedisConstants.LOGIN_USER_KEY + token;
+
+            // 只更新被修改的 3 个字段（HSET 单字段更新，不影响 Hash 中的 id、username、role 等）
+            // 判空保护：字段为 null 时存空字符串，与 login 时的存储约定保持一致
+            stringRedisTemplate.opsForHash().put(tokenKey, "nickname",
+                    user.getNickname() == null ? "" : user.getNickname());
+            stringRedisTemplate.opsForHash().put(tokenKey, "avatar",
+                    user.getAvatar() == null ? "" : user.getAvatar());
+            stringRedisTemplate.opsForHash().put(tokenKey, "phone",
+                    user.getPhone() == null ? "" : user.getPhone());
+            log.info("已同步登录态到 Redis：userId={}", user.getId());
+        } catch (Exception e) {
+            // Redis 异常不影响主流程：数据库已更新成功，用户重新登录即可刷新登录态
+            log.warn("同步登录态到 Redis 失败（不影响资料修改，重新登录可刷新）：userId={}", user.getId(), e);
+        }
+    }
+
+    /**
+     * 修改密码（需验证旧密码）
+     *
+     * <p><b>流程（5 步）：</b></p>
+     * <ol>
+     *   <li>从 ThreadLocal 获取当前登录用户 ID，查出用户实体（防越权改他人密码）</li>
+     *   <li>校验两次输入的新密码是否一致（跨字段校验，DTO 注解无法完成）</li>
+     *   <li>校验新密码不能与旧密码相同（防无意义修改）</li>
+     *   <li>BCrypt 校验旧密码是否正确</li>
+     *   <li>加密新密码并写回数据库</li>
+     * </ol>
+     *
+     * <p><b>为什么从 ThreadLocal 取 userId 而不是从参数传？</b><br>
+     * 与 {@link #updateProfile} 同理：userId 由拦截器从 Redis 登录态解析后注入 ThreadLocal，
+     * 不可被前端伪造。如果从请求参数传 userId，攻击者可以传别人的 ID 去改别人的密码，
+     * 这是严重的越权漏洞。从 ThreadLocal 取能保证"只能改自己的密码"。</p>
+     *
+     * <p><b>为什么要在 Service 层再校验两次密码一致？</b><br>
+     * {@link UserPasswordUpdateDTO} 上的 {@code @NotBlank} 只能校验单字段非空，
+     * 无法跨字段比较 newPassword 与 confirmPassword。这种"两个字段之间关系"的校验
+     * 必须放在 Service 层手动完成。</p>
+     *
+     * <p><b>为什么校验新密码不能与旧密码相同？</b><br>
+     * 1. 用户体验：如果新旧密码一样，修改密码这个操作毫无意义，应提示用户避免误操作；
+     * 2. 安全性：防止用户在"被迫修改密码"场景下用同一个密码糊弄过去。</p>
+     *
+     * <p><b>为什么不需要同步 Redis 登录态？</b><br>
+     * 登录态 Hash 中存的是 id、username、nickname、avatar、phone、status、role，
+     * <b>不包含 password</b>。改密码只影响数据库，不影响 Redis 中的登录态字段，
+     * 所以无需像 {@link #updateProfile} 那样调用 refreshLoginUserInRedis。
+     * 用户改完密码后旧 token 依然有效，无需强制重新登录（如需强制下线可额外删除 token）。</p>
+     *
+     * @param dto 修改密码参数（旧密码、新密码、确认密码）
+     * @throws BusinessException 用户不存在 / 两次密码不一致 / 新旧密码相同 / 旧密码错误
+     */
+    @Override
+    public void updatePassword(UserPasswordUpdateDTO dto) {
+        // ===== 第 1 步：获取当前登录用户并查出实体 =====
+        // 从 ThreadLocal 拿用户 ID（由拦截器注入，不可伪造），防止越权改他人密码
+        Long userId = UserHolder.getUserVO().getId();
+        log.info("修改密码：userId={}", userId);
+
+        User existUser = this.getById(userId);
+        if (existUser == null) {
+            log.warn("修改密码失败，用户不存在：userId={}", userId);
+            throw new BusinessException(ResultCode.USER_NOT_FOUND);
+        }
+
+        // ===== 第 2 步：校验两次输入的新密码是否一致 =====
+        // 跨字段校验在 Service 层完成（DTO 注解只能校验单字段非空）
+        // 用 equals 而非 == ：String 是引用类型，== 比较地址，equals 比较内容
+        if (!dto.getNewPassword().equals(dto.getConfirmPassword())) {
+            throw new BusinessException(ResultCode.USER_PASSWORD_NOT_MATCH);
+        }
+
+        // ===== 第 3 步：校验新密码不能与旧密码相同 =====
+        // 防止无意义修改；此时还没校验旧密码是否正确，但新旧相同就直接拒绝
+        if (dto.getNewPassword().equals(dto.getOldPassword())) {
+            throw new BusinessException(ResultCode.USER_PASSWORD_SAME);
+        }
+
+        // ===== 第 4 步：BCrypt 校验旧密码是否正确 =====
+        // matches(明文, 密文)：从密文提取盐值，用相同盐值对明文重新加密后比对
+        // 注意：这里比对的是 dto.getOldPassword()（用户输入的明文）与 existUser.getPassword()（数据库密文）
+        if (!passwordEncoder.matches(dto.getOldPassword(), existUser.getPassword())) {
+            throw new BusinessException(ResultCode.USER_OLD_PASSWORD_ERROR);
+        }
+
+        // ===== 第 5 步：加密新密码并写回数据库 =====
+        // encode() 每次生成随机盐，即使新密码和某用户原密码相同，密文也完全不同
+        existUser.setPassword(passwordEncoder.encode(dto.getNewPassword()));
+        // updateById 只更新被 set 过的字段（这里只有 password），其他字段不会出现在 UPDATE SQL 中
+        this.updateById(existUser);
+        log.info("修改密码成功：userId={}", userId);
+    }
+
+    // ==================== 管理员：封禁/解封用户 ====================
+
+    /**
+     * 管理员封禁用户
+     *
+     * <p><b>流程：</b>查用户是否存在 → 校验不能封禁管理员 → 将 status 置为 0 → 写库</p>
+     *
+     * <p><b>封禁的原理是什么？</b><br>
+     * 复用 User 的 status 字段（1=启用，0=禁用）。封禁就是把 status 改为 0。
+     * 登录接口的第 3 步会校验 status：如果 status=0 就拒绝登录（抛 USER_ACCOUNT_DISABLED）。
+     * 所以被封禁的用户下次登录时会被拦住，无需额外的“黑名单”表。</p>
+     *
+     * <p><b>为什么不能封禁管理员？</b><br>
+     * 防止管理员之间互相封禁导致后台无人可用（尤其是只有一个管理员的场景）。
+     * 管理员账号 role=1，通过检查 role 字段来拦截。</p>
+     *
+     * @param id 要封禁的用户 ID
+     * @throws BusinessException 用户不存在 / 目标是管理员
+     */
+    @Override
+    public void banUser(Long id) {
+        log.info("管理员封禁用户：targetUserId={}", id);
+
+        // 1. 查用户是否存在
+        User user = this.getById(id);
+        if (user == null) {
+            throw new BusinessException(ResultCode.USER_NOT_FOUND);
+        }
+
+        // 2. 校验：不能封禁管理员（role=1）
+        if (user.getRole() != null && user.getRole() == 1) {
+            log.warn("封禁失败，目标是管理员：targetUserId={}", id);
+            throw new BusinessException(ResultCode.CANNOT_BAN_ADMIN);
+        }
+
+        // 3. 将 status 置为 0（禁用），被封禁用户下次登录时会被拦截
+        user.setStatus(0);
+        this.updateById(user);
+
+        // 4. 同步下架该用户的在售/待审核商品
+        //    用户被封禁后，其商品不应再被其他人购买或审核通过。
+        //    用条件更新一次性把该卖家所有"在售(1)"和"待审核(4)"的商品改为"下架(0)"。
+        //    注意：锁定(2，有进行中订单)和已售(3)的商品不动，由订单流程自行处理。
+        LambdaUpdateWrapper<Product> productUpdate = new LambdaUpdateWrapper<>();
+        productUpdate.eq(Product::getSellerId, id)
+                .in(Product::getStatus, ProductStatus.ON_SALE, ProductStatus.PENDING_REVIEW)
+                .set(Product::getStatus, ProductStatus.OFF_SALE);
+        int takenDown = productMapper.update(null, productUpdate);
+
+        log.info("封禁用户成功：targetUserId={}, 同步下架商品{}件", id, takenDown);
+    }
+
+    /**
+     * 管理员解封用户
+     *
+     * <p><b>流程：</b>查用户是否存在 → 将 status 恢复为 1 → 写库</p>
+     *
+     * <p>解封后用户即可正常登录使用。</p>
+     *
+     * @param id 要解封的用户 ID
+     * @throws BusinessException 用户不存在
+     */
+    @Override
+    public void unbanUser(Long id) {
+        log.info("管理员解封用户：targetUserId={}", id);
+
+        // 1. 查用户是否存在
+        User user = this.getById(id);
+        if (user == null) {
+            throw new BusinessException(ResultCode.USER_NOT_FOUND);
+        }
+
+        // 2. 将 status 恢复为 1（启用）
+        user.setStatus(1);
+        this.updateById(user);
+        log.info("解封用户成功：targetUserId={}", id);
     }
 
     // ==================== 私有辅助方法 ====================

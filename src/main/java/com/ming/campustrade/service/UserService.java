@@ -5,6 +5,8 @@ import java.util.List;
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.ming.campustrade.dto.UserAddDTO;
 import com.ming.campustrade.dto.UserLoginDTO;
+import com.ming.campustrade.dto.UserPasswordUpdateDTO;
+import com.ming.campustrade.dto.UserProfileUpdateDTO;
 import com.ming.campustrade.dto.UserRegisterDTO;
 import com.ming.campustrade.entity.User;
 import com.ming.campustrade.vo.LoginVO;
@@ -74,4 +76,35 @@ public interface UserService extends IService<User> {
      * @param userAddDTO 新增用户参数
      */
     void add(UserAddDTO userAddDTO);
+
+    /**
+     * 修改个人信息（昵称、头像、手机号）
+     *
+     * <p>除写库外，还会同步更新 Redis 中的登录态，保证后续请求读到最新资料。</p>
+     *
+     * @param dto   修改参数（所有字段可选，部分更新）
+     * @param token 当前登录令牌（用于定位并同步 Redis 登录态）
+     */
+    void updateProfile(UserProfileUpdateDTO dto, String token);
+
+    /**
+     * 修改密码（需验证旧密码）
+     *
+     * @param dto 包含旧密码和新密码
+     */
+    void updatePassword(UserPasswordUpdateDTO dto);
+
+    /**
+     * 管理员封禁用户（将 status 置为 0，被封禁用户无法登录）
+     *
+     * @param id 用户 ID
+     */
+    void banUser(Long id);
+
+    /**
+     * 管理员解封用户（将 status 恢复为 1）
+     *
+     * @param id 用户 ID
+     */
+    void unbanUser(Long id);
 }

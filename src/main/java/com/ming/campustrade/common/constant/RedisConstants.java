@@ -64,4 +64,42 @@ public final class RedisConstants {
      * - 30 分钟是安全性和易用性的平衡点
      */
     public static final Long LOGIN_USER_TTL = 30L;
+
+    // ==================== 商品详情缓存 ====================
+
+    /**
+     * 商品详情缓存的 Redis Key 前缀
+     *
+     * 完整 Key 格式：product:detail:{id}
+     * 例如：product:detail:101
+     *
+     * 存储内容：ProductVO 的 JSON 字符串
+     * 使用 StringRedisTemplate.opsForValue() 存取
+     */
+    public static final String PRODUCT_DETAIL_KEY = "product:detail:";
+
+    /**
+     * 商品详情缓存的基础过期时间（单位：分钟）
+     *
+     * 实际过期时间 = 基础时间 + 随机偏移（0~10分钟）
+     * 加随机偏移是为了防止缓存雪崩（大量缓存同时过期）
+     */
+    public static final Long PRODUCT_DETAIL_TTL = 30L;
+
+    /**
+     * 缓存空值标记（防缓存穿透）
+     *
+     * 当商品在 MySQL 中不存在时，在 Redis 中存入这个标记字符串，
+     * 下次再查同一个 ID 时，看到 "NULL" 就知道商品不存在，直接返回错误，不再查 MySQL。
+     */
+    public static final String PRODUCT_NULL_VALUE = "NULL";
+
+    /**
+     * 空值缓存的过期时间（单位：分钟）
+     *
+     * 比正常缓存短得多（5分钟 vs 30分钟），因为：
+     * 1. 不存在的商品不需要缓存太久
+     * 2. 如果商品后来被创建了，5分钟后缓存过期就能查到
+     */
+    public static final Long PRODUCT_NULL_TTL = 5L;
 }

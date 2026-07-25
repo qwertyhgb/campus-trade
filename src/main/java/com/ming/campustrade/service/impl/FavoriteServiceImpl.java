@@ -44,6 +44,7 @@ import com.ming.campustrade.vo.FavoriteVO;
  */
 @Slf4j
 @Service // 告诉 Spring 容器：这是一个业务逻辑层（Service）组件，Spring 会自动扫描并创建它的实例（Bean）
+@SuppressWarnings("null") // 抑制 MyBatis-Plus Lambda 方法引用与空类型分析冲突的误报警告
 public class FavoriteServiceImpl extends ServiceImpl<FavoriteMapper, Favorite> implements FavoriteService {
 
     // 声明商品和用户的数据访问接口（Mapper），用于跨模块的数据库操作。
