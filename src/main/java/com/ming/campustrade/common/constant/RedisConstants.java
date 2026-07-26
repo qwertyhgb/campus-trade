@@ -81,6 +81,20 @@ public final class RedisConstants {
      */
     public static final String LOGIN_USER_TOKENS_KEY = "login:user_tokens:";
 
+    /**
+     * 用户封禁标记的 Redis Key 前缀
+     *
+     * <p>完整 Key 格式：login:disabled:{userId}
+     * 例如：login:disabled:1001</p>
+     *
+     * <p><b>为什么需要这个标记？</b><br>
+     * token Hash 里的 status 是登录时的快照，封禁后可能仍是旧值 1（尤其是
+     * token 集合先过期、强制下线未生效的情况）。仅靠 Hash 里的 status 判断不可靠。
+     * 封禁时实时写入 login:disabled:{userId} 标记，拦截器优先检查它，
+     * 能立即拦住被封禁的用户；解封时删除该标记。</p>
+     */
+    public static final String LOGIN_DISABLED_KEY = "login:disabled:";
+
     // ==================== 商品详情缓存 ====================
 
     /**

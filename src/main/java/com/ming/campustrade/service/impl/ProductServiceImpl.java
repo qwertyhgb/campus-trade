@@ -224,44 +224,55 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 记录修改前的状态，用于判断编辑后是否需要重新审核
         boolean wasOnSale = currentStatus != null && currentStatus == ProductStatus.ON_SALE;
 
-        // 4. 逐个字段判断：DTO 中非空的才覆盖到实体上（部分更新）
+        // 4. 构建带状态条件的更新链（防“先检查后操作”竞态）
+        //    WHERE 带上“当前状态”条件：如果在查询后、更新前商品被并发锁定/售出（状态变了），
+        //    这条 UPDATE 影响行数=0，我们会报错拒绝，避免用旧对象覆盖掉新状态。
+        //    例如：卖家读到 ON_SALE → 买家下单锁定(LOCKED) → 卖家继续更新，
+        //    因 WHERE status=ON_SALE 不匹配 LOCKED，影响行数=0，不会把 LOCKED 错误改成待审核。
+        var updateChain = this.lambdaUpdate()
+                .eq(Product::getId, id)
+                .eq(Product::getStatus, currentStatus);
+
+        // 5. 逐个字段判断：DTO 中非空的才写入（部分更新）
         if (StringUtils.hasText(dto.getTitle())) {
-            product.setTitle(dto.getTitle());
+            updateChain.set(Product::getTitle, dto.getTitle());
         }
         if (StringUtils.hasText(dto.getDescription())) {
-            product.setDescription(dto.getDescription());
+            updateChain.set(Product::getDescription, dto.getDescription());
         }
         if (dto.getPrice() != null) {
-            product.setPrice(dto.getPrice());
+            updateChain.set(Product::getPrice, dto.getPrice());
         }
         if (dto.getOriginalPrice() != null) {
-            product.setOriginalPrice(dto.getOriginalPrice());
+            updateChain.set(Product::getOriginalPrice, dto.getOriginalPrice());
         }
         if (StringUtils.hasText(dto.getImage())) {
-            product.setImage(dto.getImage());
+            updateChain.set(Product::getImage, dto.getImage());
         }
         if (dto.getCategoryId() != null) {
-            product.setCategoryId(dto.getCategoryId());
+            updateChain.set(Product::getCategoryId, dto.getCategoryId());
         }
         if (dto.getConditionLevel() != null) {
-            product.setConditionLevel(dto.getConditionLevel());
+            updateChain.set(Product::getConditionLevel, dto.getConditionLevel());
         }
 
-        // 5. 已上架的商品被编辑后，必须重新审核（防止绕过审核修改成违规内容）
+        // 6. 已上架的商品被编辑后，必须重新审核（防止绕过审核修改成违规内容）
         //    商品内容变了，原来审核通过的结论不再可信，需打回待审核状态由管理员复审。
         //    同时清空旧的审核备注（避免卖家看到上一次驳回的过时原因）。
         if (wasOnSale) {
-            product.setStatus(ProductStatus.PENDING_REVIEW);
-            product.setReviewRemark(null);
+            updateChain.set(Product::getStatus, ProductStatus.PENDING_REVIEW);
+            updateChain.set(Product::getReviewRemark, null);
             log.info("商品已上架后被编辑，转为待审核状态：productId={}", id);
         }
 
-        // 6. 写回数据库
-        //    this.updateById() 内部执行 UPDATE product SET ... WHERE id=? AND deleted=0
-        //    只更新实体中被 set 过的字段，未 set 的字段不会出现在 SQL 中
-        this.updateById(product);
+        // 7. 执行条件更新并检查影响行数
+        boolean updated = updateChain.update();
+        if (!updated) {
+            // 影响行数=0：商品状态在查询后被并发修改（如被下单锁定），拒绝本次编辑
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态已变化，请刷新后重试");
+        }
 
-        // 7. 清除 Redis 缓存（Cache-Aside 模式的"写后失效"策略）
+        // 8. 清除 Redis 缓存（Cache-Aside 模式的"写后失效"策略）
         //    商品数据变了，缓存里的旧数据必须删掉，否则用户会看到修改前的信息。
         //    下次查询时会重新从 MySQL 加载最新数据并写入缓存。
         evictProductCache(id);
@@ -305,13 +316,23 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 3. 状态限制：锁定中的商品禁止删除
         //    LOCKED 表示有进行中的订单，此时删除商品会破坏订单关联的交易数据；
         //    应等订单完成（SOLD）或取消（释放回 ON_SALE）后再处理。
-        if (product.getStatus() != null && product.getStatus() == ProductStatus.LOCKED) {
+        Integer currentStatus = product.getStatus();
+        if (currentStatus != null && currentStatus == ProductStatus.LOCKED) {
             log.warn("商品锁定中（有进行中订单），禁止删除：productId={}", id);
             throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品有进行中的订单，不能删除");
         }
     
-        // 4. 逻辑删除商品（@TableLogic 自动把 DELETE 转成 UPDATE SET deleted=1）
-        this.removeById(id);
+        // 4. 条件逻辑删除（@TableLogic 自动把 DELETE 转成 UPDATE SET deleted=1）
+        //    WHERE 带上“当前状态”条件防竞态：如果在查询后、删除前商品被并发下单锁定（状态变为 LOCKED），
+        //    这条 UPDATE 因 status 不匹配影响行数=0，我们会报错拒绝，避免删掉有进行中订单的商品。
+        LambdaQueryWrapper<Product> deleteWrapper = new LambdaQueryWrapper<>();
+        deleteWrapper.eq(Product::getId, id)
+                .eq(Product::getStatus, currentStatus);
+        boolean removed = this.remove(deleteWrapper);
+        if (!removed) {
+            // 影响行数=0：商品状态在查询后被并发修改（如被下单锁定），拒绝删除
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态已变化，请刷新后重试");
+        }
     
         // 5. 清理关联数据，避免产生“孤儿数据”
         //    商品删除后，它下面的留言和收藏若不清理会变成无主数据，

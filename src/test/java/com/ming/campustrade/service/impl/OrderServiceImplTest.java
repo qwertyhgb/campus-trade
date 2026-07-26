@@ -15,6 +15,7 @@ import com.ming.campustrade.entity.User;
 import com.ming.campustrade.mapper.OrderMapper;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
+import com.ming.campustrade.service.ProductCacheService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.UserVO;
 import org.apache.ibatis.builder.MapperBuilderAssistant;
@@ -54,6 +55,9 @@ class OrderServiceImplTest {
     @Mock
     private UserMapper userMapper;
 
+    @Mock
+    private ProductCacheService productCacheService;
+
     private OrderServiceImpl orderService;
 
     @Captor
@@ -86,7 +90,7 @@ class OrderServiceImplTest {
         currentUser.setId(BUYER_ID);
         UserHolder.saveUser(currentUser);
 
-        orderService = new OrderServiceImpl(productMapper, userMapper);
+        orderService = new OrderServiceImpl(productMapper, userMapper, productCacheService);
         Field field = CrudRepository.class.getDeclaredField("baseMapper");
         field.setAccessible(true);
         field.set(orderService, orderMapper);

@@ -22,6 +22,7 @@ import com.ming.campustrade.entity.Product;
 import com.ming.campustrade.entity.User;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
+import com.ming.campustrade.service.ProductCacheService;
 import com.ming.campustrade.service.UserService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.UserVO;
@@ -106,6 +107,11 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     private final ProductMapper productMapper;
 
     /**
+     * 商品详情缓存组件，封禁下架商品后需同步清除缓存
+     */
+    private final ProductCacheService productCacheService;
+
+    /**
      * 构造器注入
      *
      * <p>Spring 启动时发现 UserServiceImpl 需要这些类型的 Bean，
@@ -118,12 +124,14 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      * @param redisTemplate   Redis 操作模板
      * @param passwordEncoder BCrypt 密码加密器
      * @param productMapper   商品数据访问层
+     * @param productCacheService 商品详情缓存组件
      */
     public UserServiceImpl(StringRedisTemplate redisTemplate, BCryptPasswordEncoder passwordEncoder,
-                           ProductMapper productMapper) {
+                           ProductMapper productMapper, ProductCacheService productCacheService) {
         this.stringRedisTemplate = Objects.requireNonNull(redisTemplate, "redisTemplate 不能为 null");
         this.passwordEncoder = Objects.requireNonNull(passwordEncoder, "passwordEncoder 不能为 null");
         this.productMapper = Objects.requireNonNull(productMapper, "productMapper 不能为 null");
+        this.productCacheService = Objects.requireNonNull(productCacheService, "productCacheService 不能为 null");
     }
 
     // ==================== 管理员：查询所有用户 ====================
@@ -714,13 +722,24 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
 
         // 4. 同步下架该用户的在售/待审核商品
         //    用户被封禁后，其商品不应再被其他人购买或审核通过。
-        //    用条件更新一次性把该卖家所有"在售(1)"和"待审核(4)"的商品改为"下架(0)"。
+        //    用条件更新一次性把该卖家所有“在售(1)”和“待审核(4)”的商品改为“下架(0)”。
         //    注意：锁定(2，有进行中订单)和已售(3)的商品不动，由订单流程自行处理。
+        //    下架前先查出这些商品的 ID，用于下架后清除它们的详情缓存。
+        List<Long> takenDownProductIds = productMapper.selectList(
+                new LambdaQueryWrapper<Product>()
+                        .eq(Product::getSellerId, id)
+                        .in(Product::getStatus, ProductStatus.ON_SALE, ProductStatus.PENDING_REVIEW)
+                        .select(Product::getId))
+                .stream().map(Product::getId).toList();
+        
         LambdaUpdateWrapper<Product> productUpdate = new LambdaUpdateWrapper<>();
         productUpdate.eq(Product::getSellerId, id)
                 .in(Product::getStatus, ProductStatus.ON_SALE, ProductStatus.PENDING_REVIEW)
                 .set(Product::getStatus, ProductStatus.OFF_SALE);
         int takenDown = productMapper.update(null, productUpdate);
+        
+        // 逐个清除被下架商品的详情缓存，避免用户继续看到旧的“在售”状态
+        takenDownProductIds.forEach(productCacheService::evict);
 
         // 5. 强制下线：删除该用户所有有效的登录态 token
         //    只改数据库 status 是不够的——用户已登录的旧 token 仍在 Redis 中，
@@ -728,6 +747,14 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         //    通过反向索引 login:user_tokens:{userId} 拿到他所有 token 并逐个删除，
         //    再删除集合本身，让用户立即下线。
         forceLogoutAll(id);
+
+        // 6. 写入封禁标记：即使有 token 因 Redis 抖动残留，拦截器检查到此标记也会立即拒绝
+        //    这是比删除 token 更可靠的“即时生效”手段（不依赖反向索引是否完整）。
+        try {
+            stringRedisTemplate.opsForValue().set(RedisConstants.LOGIN_DISABLED_KEY + id, "1");
+        } catch (Exception e) {
+            log.warn("写入封禁标记失败（拦截器仍会靠 status 兑底）：userId={}", id, e);
+        }
 
         log.info("封禁用户成功：targetUserId={}, 同步下架商品{}件，已强制下线", id, takenDown);
     }
@@ -784,6 +811,13 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         // 2. 将 status 恢复为 1（启用）
         user.setStatus(1);
         this.updateById(user);
+
+        // 3. 删除封禁标记，让用户可以正常访问
+        try {
+            stringRedisTemplate.delete(RedisConstants.LOGIN_DISABLED_KEY + id);
+        } catch (Exception e) {
+            log.warn("删除封禁标记失败：userId={}", id, e);
+        }
         log.info("解封用户成功：targetUserId={}", id);
     }
 

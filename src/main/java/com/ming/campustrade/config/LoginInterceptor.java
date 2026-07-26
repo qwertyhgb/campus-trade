@@ -111,11 +111,14 @@ public class LoginInterceptor implements HandlerInterceptor {
         String roleStr = (String) userMap.get("role");
         userVO.setRole(StringUtils.hasText(roleStr) ? Integer.parseInt(roleStr) : 0);
 
-        // 6.5 防御性校验：如果用户已被封禁（status=0），即使 token 还在也拒绝访问
-        //     正常情况下封禁时已删除了该用户的所有 token，这里是“兑底”：
-        //     万一某个 token 因 Redis 抖动等原因残留下来，也不会让被封禁的用户继续访问。
-        //     同时删除这个残留 token，避免它被滑动过期机制不断续期。
-        if (userVO.getStatus() != null && userVO.getStatus() == 0) {
+        // 6.5 封禁即时拦截：优先检查封禁标记（比 token Hash 中的 status 快照更可靠）
+        //     token Hash 里的 status 是登录时的快照，封禁后可能仍是旧值 1；
+        //     而 login:disabled:{userId} 是封禁时实时写入的标记，能立即生效。
+        //     两者任一命中都拒绝访问，并清理残留 token 避免被滑动过期不断续期。
+        String disabledKey = RedisConstants.LOGIN_DISABLED_KEY + userVO.getId();
+        boolean isDisabled = Boolean.TRUE.equals(stringRedisTemplate.hasKey(disabledKey))
+                || (userVO.getStatus() != null && userVO.getStatus() == 0);
+        if (isDisabled) {
             log.warn("被封禁用户尝试访问，已拦截并清理残留token：userId={}", userVO.getId());
             stringRedisTemplate.delete(tokenKey);
             return unauthorized(response);
@@ -129,6 +132,14 @@ public class LoginInterceptor implements HandlerInterceptor {
                 tokenKey,
                 Duration.ofMinutes(RedisConstants.LOGIN_USER_TTL)
         );
+
+        // 8.5 同步刷新 token 反向索引集合的 TTL，与 token Hash 的滑动过期保持一致
+        //     如果只刷新 token Hash 而不刷新集合，集合可能先于 token 过期，
+        //     导致封禁时反向索引已失效、无法拿到 token 强制下线。
+        //     SADD 对 Set 是幂等的（重复加同一个 token 无副作用），expire 重新 set TTL。
+        String userTokensKey = RedisConstants.LOGIN_USER_TOKENS_KEY + userVO.getId();
+        stringRedisTemplate.opsForSet().add(userTokensKey, token);
+        stringRedisTemplate.expire(userTokensKey, Duration.ofMinutes(RedisConstants.LOGIN_USER_TTL));
 
         // 使用 debug 级别：每个认证请求都会经过这里，info 级别在生产环境会产生海量日志
         log.debug("Token 验证通过：userId={}, username={}", userVO.getId(), userVO.getUsername());

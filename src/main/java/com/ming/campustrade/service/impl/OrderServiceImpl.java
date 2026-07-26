@@ -25,6 +25,7 @@ import com.ming.campustrade.mapper.OrderMapper;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
 import com.ming.campustrade.service.OrderService;
+import com.ming.campustrade.service.ProductCacheService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.OrderVO;
 import lombok.extern.slf4j.Slf4j;
@@ -38,14 +39,17 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     // 使用 final 修饰，确保在构造函数初始化后不能再被修改，符合安全和不变性原则
     private final ProductMapper productMapper;
     private final UserMapper userMapper;
+    // 商品详情缓存组件：订单流程会改变商品状态（锁定/售出/释放），需同步清除商品缓存
+    private final ProductCacheService productCacheService;
 
     /**
      * 构造函数注入（Spring 推荐的依赖注入方式）：
-     * Spring 在实例化 OrderServiceImpl 时，会自动查找容器中的 ProductMapper 和 UserMapper 实例并注入进来
+     * Spring 在实例化 OrderServiceImpl 时，会自动查找容器中的这些实例并注入进来
      */
-    public OrderServiceImpl(ProductMapper productMapper, UserMapper userMapper) {
+    public OrderServiceImpl(ProductMapper productMapper, UserMapper userMapper, ProductCacheService productCacheService) {
         this.productMapper = productMapper;
         this.userMapper = userMapper;
+        this.productCacheService = productCacheService;
     }
 
     /**
@@ -120,6 +124,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
 
         // 11. 保存订单到数据库（ServiceImpl 提供的 save 方法，实际底层会调用 orderMapper.insert）
         this.save(order);
+        // 商品已被锁定（ON_SALE→LOCKED），清除详情缓存避免其他用户看到过期的“在售”状态
+        productCacheService.evict(order.getProductId());
         log.info("下单成功：orderId={}, orderNo={}, productId={}", order.getId(), order.getOrderNo(), order.getProductId());
     }
 
@@ -187,6 +193,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         if (productUpdated == 0) {
             throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态异常，确认失败");
         }
+        // 商品已售出（LOCKED→SOLD），清除详情缓存
+        productCacheService.evict(order.getProductId());
         log.info("确认订单成功：orderId={}, productId={}", id, order.getProductId());
     }
 
@@ -243,6 +251,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         if (productUpdated == 0) {
             throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态异常，取消失败");
         }
+        // 商品已释放（LOCKED→ON_SALE），清除详情缓存
+        productCacheService.evict(order.getProductId());
         log.info("取消订单成功：orderId={}, productId={}", id, order.getProductId());
     }
 
@@ -498,6 +508,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态异常，超时取消回滚");
         }
 
+        // 商品已释放（LOCKED→ON_SALE），清除详情缓存
+        productCacheService.evict(order.getProductId());
         log.info("超时订单已自动取消：orderId={}, orderNo={}, productId={}",
                 order.getId(), order.getOrderNo(), order.getProductId());
         return true;

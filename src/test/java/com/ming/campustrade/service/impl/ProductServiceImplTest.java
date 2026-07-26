@@ -166,10 +166,12 @@ class ProductServiceImplTest {
     class UpdateProduct {
 
         @Test
-        @DisplayName("成功修改商品标题和价格")
+        @DisplayName("成功修改商品标题和价格（条件更新）")
         void shouldUpdateSuccessfully() {
             Product original = createProduct(PRODUCT_ID, SELLER_ID, ProductStatus.ON_SALE);
             when(productMapper.selectById(PRODUCT_ID)).thenReturn(original);
+            // 条件更新影响行数=1（更新成功）
+            when(productMapper.update(isNull(), any())).thenReturn(1);
 
             ProductUpdateDTO dto = new ProductUpdateDTO();
             dto.setTitle("新标题");
@@ -177,11 +179,24 @@ class ProductServiceImplTest {
 
             productService.updateProduct(PRODUCT_ID, dto);
 
-            verify(productMapper).updateById((Product) productCaptor.capture());
-            Product updated = productCaptor.getValue();
-            assertThat(updated.getTitle()).isEqualTo("新标题");
-            assertThat(updated.getPrice()).isEqualByComparingTo("200");
-            assertThat(updated.getDescription()).isNull(); // 未传，保持 null
+            // 验证执行了条件更新（WHERE 带状态条件防竞态）
+            verify(productMapper).update(isNull(), any());
+        }
+
+        @Test
+        @DisplayName("并发下商品状态已变更时编辑失败（条件更新影响行数=0）")
+        void shouldThrowWhenUpdateRaceLost() {
+            Product original = createProduct(PRODUCT_ID, SELLER_ID, ProductStatus.ON_SALE);
+            when(productMapper.selectById(PRODUCT_ID)).thenReturn(original);
+            // 条件更新影响行数=0（如商品已被下单锁定）
+            when(productMapper.update(isNull(), any())).thenReturn(0);
+
+            ProductUpdateDTO dto = new ProductUpdateDTO();
+            dto.setTitle("新标题");
+
+            assertThatThrownBy(() -> productService.updateProduct(PRODUCT_ID, dto))
+                    .isInstanceOf(BusinessException.class)
+                    .hasFieldOrPropertyWithValue("code", ResultCode.PRODUCT_STATUS_ERROR.getCode());
         }
 
         @Test
@@ -213,13 +228,15 @@ class ProductServiceImplTest {
     class DeleteProduct {
 
         @Test
-        @DisplayName("成功删除商品（逻辑删除），并清除缓存")
+        @DisplayName("成功删除商品（条件逻辑删除），并清除缓存")
         void shouldDeleteSuccessfully() {
             when(productMapper.selectById(PRODUCT_ID)).thenReturn(createProduct(PRODUCT_ID, SELLER_ID, ProductStatus.ON_SALE));
+            // 条件删除影响行数=1（删除成功）
+            when(productMapper.delete(any())).thenReturn(1);
 
             productService.deleteProduct(PRODUCT_ID);
 
-            verify(productMapper).deleteById(PRODUCT_ID);
+            verify(productMapper).delete(any());
             verify(stringRedisTemplate).delete(RedisConstants.PRODUCT_DETAIL_KEY + PRODUCT_ID);
         }
 
@@ -231,7 +248,7 @@ class ProductServiceImplTest {
             assertThatThrownBy(() -> productService.deleteProduct(999L))
                     .isInstanceOf(BusinessException.class)
                     .hasFieldOrPropertyWithValue("code", ResultCode.PRODUCT_NOT_FOUND.getCode());
-            verify(productMapper, never()).deleteById(anyLong());
+            verify(productMapper, never()).delete(any());
         }
 
         @Test
