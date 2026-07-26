@@ -20,8 +20,11 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.validation.annotation.Validated;
 
 /**
  * 商品留言控制器 —— 处理留言的发表、删除、查询等 HTTP 请求。
@@ -47,6 +50,7 @@ import lombok.extern.slf4j.Slf4j;
 @Tag(name = "商品留言管理", description = "商品留言的发表、删除、查询顶级留言、查询回复等操作")
 @RestController
 @RequestMapping("/comment")
+@Validated // 启用方法参数（@RequestParam/@PathVariable）上的约束校验（如 @Min/@Max）
 public class CommentController {
 
     private final CommentService commentService;
@@ -113,8 +117,8 @@ public class CommentController {
     @PublicApi
     @GetMapping("/product/{productId}")
     public Result<IPage<CommentVO>> listByProduct(@Parameter(description = "商品ID") @PathVariable Long productId,
-                                                  @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") Integer pageNo,
-                                                  @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") Integer pageSize) {
+                                                  @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+                                                  @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer pageSize) {
         log.info("查询商品留言列表：productId={}, pageNo={}, pageSize={}", productId, pageNo, pageSize);
         return Result.success(commentService.getCommentsByProduct(productId, pageNo, pageSize));
     }
@@ -133,8 +137,8 @@ public class CommentController {
     @PublicApi
     @GetMapping("/{parentId}/replies")
     public Result<IPage<CommentVO>> listReplies(@Parameter(description = "父留言ID") @PathVariable Long parentId,
-                                                @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") Integer pageNo,
-                                                @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") Integer pageSize) {
+                                                @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+                                                @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer pageSize) {
         log.info("查询留言回复列表：parentId={}, pageNo={}, pageSize={}", parentId, pageNo, pageSize);
         return Result.success(commentService.getReplies(parentId, pageNo, pageSize));
     }
@@ -150,8 +154,8 @@ public class CommentController {
      */
     @Operation(summary = "我的留言列表", description = "分页查询当前登录用户发表的全部留言，按时间倒序")
     @GetMapping("/my")
-    public Result<IPage<CommentVO>> myComments(@Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") Integer pageNo,
-                                               @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") Integer pageSize) {
+    public Result<IPage<CommentVO>> myComments(@Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+                                               @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer pageSize) {
         log.info("查询我的留言列表：pageNo={}, pageSize={}", pageNo, pageSize);
         return Result.success(commentService.getMyComments(pageNo, pageSize));
     }

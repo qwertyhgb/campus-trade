@@ -220,11 +220,33 @@ class OrderServiceImplTest {
             UserHolder.saveUser(seller);
 
             when(orderMapper.selectById(ORDER_ID)).thenReturn(pendingOrder());
+            // 条件更新：订单 PENDING→CONFIRMED、商品 LOCKED→SOLD 都成功（影响行数=1）
+            when(orderMapper.update(isNull(), any())).thenReturn(1);
+            when(productMapper.update(isNull(), any())).thenReturn(1);
 
             orderService.confirmOrder(ORDER_ID);
 
-            verify(orderMapper).updateById((Order) orderCaptor.capture());
-            assertThat(orderCaptor.getValue().getStatus()).isEqualTo(OrderStatus.CONFIRMED);
+            // 验证订单和商品的条件更新都被执行
+            verify(orderMapper).update(isNull(), any());
+            verify(productMapper).update(isNull(), any());
+        }
+
+        @Test
+        @DisplayName("并发下订单状态已变更时确认失败（条件更新影响行数=0）")
+        void shouldThrowWhenConfirmRaceLost() {
+            UserHolder.removeUser();
+            UserVO seller = new UserVO();
+            seller.setId(SELLER_ID);
+            UserHolder.saveUser(seller);
+
+            when(orderMapper.selectById(ORDER_ID)).thenReturn(pendingOrder());
+            // 订单条件更新影响行数=0（如已被买家取消）
+            when(orderMapper.update(isNull(), any())).thenReturn(0);
+
+            assertThatThrownBy(() -> orderService.confirmOrder(ORDER_ID))
+                    .isInstanceOf(BusinessException.class)
+                    .hasFieldOrPropertyWithValue("code", ResultCode.ORDER_STATUS_ERROR.getCode());
+            verify(productMapper, never()).update(isNull(), any());
         }
 
         @Test
@@ -275,11 +297,14 @@ class OrderServiceImplTest {
         @DisplayName("成功取消待确认订单（商品恢复在售）")
         void shouldCancelPendingOrderSuccessfully() {
             when(orderMapper.selectById(ORDER_ID)).thenReturn(pendingOrder());
+            // 条件更新：订单 PENDING→CANCELED、商品 LOCKED→ON_SALE 都成功
+            when(orderMapper.update(isNull(), any())).thenReturn(1);
+            when(productMapper.update(isNull(), any())).thenReturn(1);
 
             orderService.cancelOrder(ORDER_ID);
 
-            verify(orderMapper).updateById((Order) orderCaptor.capture());
-            assertThat(orderCaptor.getValue().getStatus()).isEqualTo(OrderStatus.CANCELED);
+            verify(orderMapper).update(isNull(), any());
+            verify(productMapper).update(isNull(), any());
         }
 
         @Test

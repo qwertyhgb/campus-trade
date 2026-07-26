@@ -111,6 +111,16 @@ public class LoginInterceptor implements HandlerInterceptor {
         String roleStr = (String) userMap.get("role");
         userVO.setRole(StringUtils.hasText(roleStr) ? Integer.parseInt(roleStr) : 0);
 
+        // 6.5 防御性校验：如果用户已被封禁（status=0），即使 token 还在也拒绝访问
+        //     正常情况下封禁时已删除了该用户的所有 token，这里是“兑底”：
+        //     万一某个 token 因 Redis 抖动等原因残留下来，也不会让被封禁的用户继续访问。
+        //     同时删除这个残留 token，避免它被滑动过期机制不断续期。
+        if (userVO.getStatus() != null && userVO.getStatus() == 0) {
+            log.warn("被封禁用户尝试访问，已拦截并清理残留token：userId={}", userVO.getId());
+            stringRedisTemplate.delete(tokenKey);
+            return unauthorized(response);
+        }
+
         // 7. 将用户信息存入 ThreadLocal，方便后续 Controller/Service 使用
         UserHolder.saveUser(userVO);
 

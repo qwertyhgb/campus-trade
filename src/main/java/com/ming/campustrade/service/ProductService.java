@@ -27,8 +27,20 @@ public interface ProductService extends IService<Product> {
 
     /**
      * 查看商品详情（浏览量+1）
+     *
+     * <p>公开接口，仅返回在售（ON_SALE）商品，防止枚举 ID 泄露未上架商品。</p>
      */
     ProductVO getProductById(Long id);
+
+    /**
+     * 卖家查看自己的商品详情（任意状态，含审核备注，仅本人）
+     */
+    ProductVO getMyProductById(Long id);
+
+    /**
+     * 管理员查看商品详情（任意状态，含审核备注，不校验归属）
+     */
+    ProductVO getProductByIdForAdmin(Long id);
 
     /**
      * 商品列表（分页 + 筛选 + 排序，只查在售商品）

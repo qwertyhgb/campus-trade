@@ -101,3 +101,22 @@ ALTER TABLE `order` ADD INDEX idx_buyerid_createtime (buyer_id, create_time);
 --   中无法同时服务两种查询（最左前缀决定了索引必须从最左列开始匹配）。
 -- ========================================================================
 ALTER TABLE `order` ADD INDEX idx_sellerid_createtime (seller_id, create_time);
+
+-- ========================================================================
+-- 联合索引 3：定时任务扫描超时未确认订单
+-- ========================================================================
+-- SQL 原型：SELECT * FROM `order` WHERE status=0 AND create_time < ?
+-- 查询频率：高（OrderTimeoutTask 每 60 秒执行一次）
+--
+-- 为什么需要 (status, create_time)？
+--   超时取消任务的核心查询是“找出所有待确认(status=0)且创建时间早于超时点”的订单。
+--   如果只有单列 idx_status，定位到 status=0 后还需逐行比较 create_time（且待确认
+--   订单可能很多，过滤效果差）；联合索引 (status, create_time) 让 status=0 等值过滤后，
+--   create_time 在索引内有序，create_time < ? 的范围扫描直接走索引，无需回表逐行比较。
+--
+-- 最左前缀实践：
+--   ✅ WHERE status=0 AND create_time < ?   → 完全命中（超时扫描）
+--   ✅ WHERE status=0                        → 命中最左列
+--   ❌ WHERE create_time < ?                 → 未从 status 开始，无法使用
+-- ========================================================================
+ALTER TABLE `order` ADD INDEX idx_status_createtime (status, create_time);

@@ -2,6 +2,8 @@ package com.ming.campustrade.dto;
 
 import java.math.BigDecimal;
 
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import lombok.Data;
 
 /**
@@ -19,10 +21,13 @@ import lombok.Data;
 @Data
 public class ProductQueryDTO {
 
-    /** 页码，默认第 1 页。 */
+    /** 页码，默认第 1 页，最小 1。 */
+    @Min(value = 1, message = "页码最小为1")
     private Integer pageNo = 1;
 
-    /** 每页条数，默认 10 条。 */
+    /** 每页条数，默认 10 条，限制 1~100（防止恶意请求超大分页拖垮数据库）。 */
+    @Min(value = 1, message = "每页条数最小为1")
+    @Max(value = 100, message = "每页条数最大为100")
     private Integer pageSize = 10;
 
     /** 搜索关键词（模糊匹配标题）。 */

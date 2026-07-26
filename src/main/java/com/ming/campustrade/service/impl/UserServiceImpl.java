@@ -31,6 +31,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 import lombok.extern.slf4j.Slf4j;
@@ -209,12 +210,21 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     // ==================== 查询用户详情 ====================
 
     /**
-     * 根据 ID 查询用户详情
+     * 根据 ID 查询用户详情（隐私保护）
      *
-     * <p><b>流程：</b>根据 ID 查用户 → 判空 → 转换为 VO 返回</p>
+     * <p><b>流程：</b>根据 ID 查用户 → 判空 → 按请求者身份返回不同粒度的信息</p>
+     *
+     * <p><b>为什么要区分身份返回？（隐私关键）</b><br>
+     * 旧实现任何登录用户查任意 ID 都能拿到手机号、账号状态、角色等敏感信息，
+     * 这是隐私泄露。现在按请求者身份分级：</p>
+     * <ul>
+     *   <li>查自己 或 管理员 → 返回完整信息（含手机号、状态、角色等）</li>
+     *   <li>查他人（普通用户）→ 只返回公开信息（id、昵称、头像），
+     *       不暴露手机号、用户名、状态、角色、创建时间</li>
+     * </ul>
      *
      * @param id 用户 ID
-     * @return 用户视图对象
+     * @return 用户视图对象（按请求者身份决定字段粒度）
      * @throws BusinessException 用户不存在时抛出 USER_NOT_FOUND
      */
     @Override
@@ -227,8 +237,20 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             throw new BusinessException(ResultCode.USER_NOT_FOUND, "用户不存在");
         }
 
-        // 2. 实体转 VO，过滤掉 password 等敏感字段
-        return convertToUserVO(user);
+        // 2. 判断请求者身份：是否是本人或管理员
+        UserVO currentUser = UserHolder.getUserVO();
+        boolean isSelf = currentUser != null && id.equals(currentUser.getId());
+        boolean isAdmin = currentUser != null && currentUser.getRole() != null && currentUser.getRole() >= 1;
+
+        // 3. 本人或管理员 → 返回完整信息；其他人 → 只返回公开信息（保护隐私）
+        if (isSelf || isAdmin) {
+            return convertToUserVO(user);
+        }
+        UserVO publicVO = new UserVO();
+        publicVO.setId(user.getId());
+        publicVO.setNickname(user.getNickname());
+        publicVO.setAvatar(user.getAvatar());
+        return publicVO;
     }
 
     // ==================== 用户注册 ====================
@@ -388,6 +410,14 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         //     这比固定过期时间更友好——不会在用户操作到一半时突然踢出登录。
         stringRedisTemplate.expire(tokenKey, Duration.ofMinutes(RedisConstants.LOGIN_USER_TTL));
 
+        // 4.6 维护用户 Token 反向索引（用于封禁时强制下线）
+        //     把当前 token 加入该用户的 token 集合：SADD login:user_tokens:{userId} {token}
+        //     封禁用户时就能一次拿到他所有 token 并全部删除。
+        //     集合也设置过期时间，避免用户长期不登录后集合永久残留。
+        String userTokensKey = RedisConstants.LOGIN_USER_TOKENS_KEY + userVO.getId();
+        stringRedisTemplate.opsForSet().add(userTokensKey, token);
+        stringRedisTemplate.expire(userTokensKey, Duration.ofMinutes(RedisConstants.LOGIN_USER_TTL));
+
         // ===== 第 5 步：组装返回结果 =====
         LoginVO loginVO = new LoginVO();
         loginVO.setToken(token);
@@ -430,11 +460,14 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             token = token.substring(7);  // "Bearer " 长度为 7
         }
 
-        // 3. 拼接 Redis key 并删除
+        // 3. 删除前先读出用户 ID（用于后续从反向索引中移除 token）
         String tokenKey = RedisConstants.LOGIN_USER_KEY + token;
+        Object idObj = stringRedisTemplate.opsForHash().get(tokenKey, "id");
+
+        // 4. 拼接 Redis key 并删除登录态 Hash
         Boolean deleted = stringRedisTemplate.delete(tokenKey);
 
-        // 4. 判断删除结果
+        // 5. 判断删除结果
         //    delete() 返回 true 表示成功删除了 key，false 表示 key 不存在（已过期或从未登录）
         //    用 Boolean.FALSE.equals() 而不是 !deleted，防止 deleted 为 null 时 NPE
         if (Boolean.FALSE.equals(deleted)) {
@@ -442,6 +475,15 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             log.warn("退出登录失败，Token 已过期：tokenKeyPrefix={}...{}",
                     RedisConstants.LOGIN_USER_KEY, token.substring(0, Math.min(8, token.length())));
             throw new BusinessException(ResultCode.UNAUTHORIZED, "未登录或登录已过期");
+        }
+
+        // 6. 从用户 Token 反向索引中移除该 token（保持索引干净，最佳努力、失败不影响退出）
+        if (idObj != null) {
+            try {
+                stringRedisTemplate.opsForSet().remove(RedisConstants.LOGIN_USER_TOKENS_KEY + idObj, token);
+            } catch (Exception e) {
+                log.warn("退出登录时清理 Token 反向索引失败（不影响退出）：userId={}", idObj, e);
+            }
         }
         log.info("用户退出登录成功");
     }
@@ -680,7 +722,43 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
                 .set(Product::getStatus, ProductStatus.OFF_SALE);
         int takenDown = productMapper.update(null, productUpdate);
 
-        log.info("封禁用户成功：targetUserId={}, 同步下架商品{}件", id, takenDown);
+        // 5. 强制下线：删除该用户所有有效的登录态 token
+        //    只改数据库 status 是不够的——用户已登录的旧 token 仍在 Redis 中，
+        //    在过期前（且滑动过期会不断续期）仍能正常访问接口。
+        //    通过反向索引 login:user_tokens:{userId} 拿到他所有 token 并逐个删除，
+        //    再删除集合本身，让用户立即下线。
+        forceLogoutAll(id);
+
+        log.info("封禁用户成功：targetUserId={}, 同步下架商品{}件，已强制下线", id, takenDown);
+    }
+
+    /**
+     * 强制某用户全部登录态下线（删除其所有 token）
+     *
+     * <p>通过反向索引 login:user_tokens:{userId} 拿到该用户所有 token，
+     * 逐个删除对应的 login:user{token} 登录态 Hash，最后删除集合本身。</p>
+     *
+     * <p><b>为什么用 try-catch 包裹？</b><br>
+     * 封禁的核心动作（改 status、下架商品）已完成。删除 Redis 登录态若因 Redis
+     * 抖动失败，不应让整个封禁接口报 500。即使个别 token 残留，
+     * 登录拦截器的防御性校验（拒绝 status=0 的用户）也会兑底，不会漏放。</p>
+     *
+     * @param userId 要强制下线的用户 ID
+     */
+    private void forceLogoutAll(Long userId) {
+        try {
+            String userTokensKey = RedisConstants.LOGIN_USER_TOKENS_KEY + userId;
+            Set<String> tokens = stringRedisTemplate.opsForSet().members(userTokensKey);
+            if (tokens != null && !tokens.isEmpty()) {
+                for (String token : tokens) {
+                    stringRedisTemplate.delete(RedisConstants.LOGIN_USER_KEY + token);
+                }
+            }
+            stringRedisTemplate.delete(userTokensKey);
+            log.info("已强制用户下线：userId={}, 清理token{}个", userId, tokens == null ? 0 : tokens.size());
+        } catch (Exception e) {
+            log.warn("强制下线失败（拦截器防御校验会兑底）：userId={}", userId, e);
+        }
     }
 
     /**

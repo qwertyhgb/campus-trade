@@ -65,6 +65,22 @@ public final class RedisConstants {
      */
     public static final Long LOGIN_USER_TTL = 30L;
 
+    /**
+     * 用户 Token 反向索引的 Redis Key 前缀
+     *
+     * <p>完整 Key 格式：login:user_tokens:{userId}
+     * 例如：login:user_tokens:1001</p>
+     *
+     * <p>存储结构：Redis Set，成员是该用户当前所有有效的 token（原始 UUID，不含前缀）。</p>
+     *
+     * <p><b>为什么需要这个反向索引？</b><br>
+     * login:user{token} 是“token → 用户信息”的正向映射，只能根据 token 查用户。
+     * 但封禁用户时需要“根据 userId 找到他所有的 token 并全部删除”（强制下线），
+     * 没有反向索引就只能用 SCAN 扫描所有 key（性能差、生产环境禁用）。
+     * 维护一个 userId → tokens 的 Set，封禁时一次 SMEMBERS 即可拿到全部 token。</p>
+     */
+    public static final String LOGIN_USER_TOKENS_KEY = "login:user_tokens:";
+
     // ==================== 商品详情缓存 ====================
 
     /**

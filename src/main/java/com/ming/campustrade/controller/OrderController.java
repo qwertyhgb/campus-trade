@@ -19,8 +19,11 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.validation.annotation.Validated;
 
 /**
  * 订单管理控制器 —— 处理订单的创建、确认、取消、查询等 HTTP 请求。
@@ -69,6 +72,7 @@ import lombok.extern.slf4j.Slf4j;
 @Tag(name = "订单管理", description = "订单的创建、确认、取消、查询等操作")
 @RestController
 @RequestMapping("/order")
+@Validated // 启用方法参数（@RequestParam/@PathVariable）上的约束校验（如 @Min/@Max）
 public class OrderController {
 
     private final OrderService orderService;
@@ -169,8 +173,8 @@ public class OrderController {
      */
     @Operation(summary = "我买到的订单", description = "分页查询当前登录买家购买的订单列表，按时间倒序")
     @GetMapping("/buy")
-    public Result<IPage<OrderVO>> getBuyOrder(@Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") Integer pageNo,
-                                                @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") Integer pageSize) {
+    public Result<IPage<OrderVO>> getBuyOrder(@Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+                                                @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer pageSize) {
         log.info("查询我买到的订单：pageNo={}, pageSize={}", pageNo, pageSize);
         return Result.success(orderService.getBuyOrder(pageNo, pageSize));
     }
@@ -186,8 +190,8 @@ public class OrderController {
      */
     @Operation(summary = "我卖出的订单", description = "分页查询当前登录卖家卖出的订单列表，按时间倒序")
     @GetMapping("/sell")
-    public Result<IPage<OrderVO>> getSellOrder(@Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") Integer pageNo,
-                                                 @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") Integer pageSize) {
+    public Result<IPage<OrderVO>> getSellOrder(@Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+                                                 @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer pageSize) {
         log.info("查询我卖出的订单：pageNo={}, pageSize={}", pageNo, pageSize);
         return Result.success(orderService.getSellOrder(pageNo, pageSize));
     }

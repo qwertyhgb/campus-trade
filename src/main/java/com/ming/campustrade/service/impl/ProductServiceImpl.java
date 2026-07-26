@@ -27,6 +27,7 @@ import lombok.extern.slf4j.Slf4j;
 
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.Duration;
@@ -210,10 +211,20 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 2. 校验权限：只有商品的主人才能修改
         checkOwnership(product);
 
-        // 记录修改前的状态，用于判断编辑后是否需要重新审核
-        boolean wasOnSale = product.getStatus() != null && product.getStatus() == ProductStatus.ON_SALE;
+        // 3. 状态限制：锁定/已售的商品禁止编辑
+        //    LOCKED（有进行中的订单）：此时改价格/标题会让买卖双方对交易内容产生分歧
+        //    SOLD（已成交）：交易已完成，商品信息应作为历史凭证保留，不允许再改
+        Integer currentStatus = product.getStatus();
+        if (currentStatus != null
+                && (currentStatus == ProductStatus.LOCKED || currentStatus == ProductStatus.SOLD)) {
+            log.warn("商品当前状态不允许编辑：productId={}, status={}", id, currentStatus);
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "当前商品状态不允许编辑");
+        }
 
-        // 3. 逐个字段判断：DTO 中非空的才覆盖到实体上（部分更新）
+        // 记录修改前的状态，用于判断编辑后是否需要重新审核
+        boolean wasOnSale = currentStatus != null && currentStatus == ProductStatus.ON_SALE;
+
+        // 4. 逐个字段判断：DTO 中非空的才覆盖到实体上（部分更新）
         if (StringUtils.hasText(dto.getTitle())) {
             product.setTitle(dto.getTitle());
         }
@@ -236,7 +247,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             product.setConditionLevel(dto.getConditionLevel());
         }
 
-        // 4. 已上架的商品被编辑后，必须重新审核（防止绕过审核修改成违规内容）
+        // 5. 已上架的商品被编辑后，必须重新审核（防止绕过审核修改成违规内容）
         //    商品内容变了，原来审核通过的结论不再可信，需打回待审核状态由管理员复审。
         //    同时清空旧的审核备注（避免卖家看到上一次驳回的过时原因）。
         if (wasOnSale) {
@@ -245,12 +256,12 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             log.info("商品已上架后被编辑，转为待审核状态：productId={}", id);
         }
 
-        // 5. 写回数据库
+        // 6. 写回数据库
         //    this.updateById() 内部执行 UPDATE product SET ... WHERE id=? AND deleted=0
         //    只更新实体中被 set 过的字段，未 set 的字段不会出现在 SQL 中
         this.updateById(product);
 
-        // 6. 清除 Redis 缓存（Cache-Aside 模式的"写后失效"策略）
+        // 7. 清除 Redis 缓存（Cache-Aside 模式的"写后失效"策略）
         //    商品数据变了，缓存里的旧数据必须删掉，否则用户会看到修改前的信息。
         //    下次查询时会重新从 MySQL 加载最新数据并写入缓存。
         evictProductCache(id);
@@ -279,6 +290,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
      * @param id 商品 ID
      */
     @Override
+    @Transactional // 删除商品 + 清理留言/收藏是多表写操作，需事务保证要么都成功要么都回滚
     public void deleteProduct(Long id) {
         log.info("删除商品：productId={}", id);
         // 1. 查商品是否存在
@@ -286,29 +298,37 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         if (product == null) {
             throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
         }
-
+    
         // 2. 校验权限：只有本人能删自己的商品
         checkOwnership(product);
-
-        // 3. 逻辑删除商品（@TableLogic 自动把 DELETE 转成 UPDATE SET deleted=1）
+    
+        // 3. 状态限制：锁定中的商品禁止删除
+        //    LOCKED 表示有进行中的订单，此时删除商品会破坏订单关联的交易数据；
+        //    应等订单完成（SOLD）或取消（释放回 ON_SALE）后再处理。
+        if (product.getStatus() != null && product.getStatus() == ProductStatus.LOCKED) {
+            log.warn("商品锁定中（有进行中订单），禁止删除：productId={}", id);
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品有进行中的订单，不能删除");
+        }
+    
+        // 4. 逻辑删除商品（@TableLogic 自动把 DELETE 转成 UPDATE SET deleted=1）
         this.removeById(id);
-
-        // 4. 清理关联数据，避免产生"孤儿数据"
+    
+        // 5. 清理关联数据，避免产生“孤儿数据”
         //    商品删除后，它下面的留言和收藏若不清理会变成无主数据，
-        //    既浪费存储，又可能在"我的收藏"等列表里查出已删除的商品。
+        //    既浪费存储，又可能在“我的收藏”等列表里查出已删除的商品。
         //    - 留言（Comment 有 @TableLogic）：delete 会被改写成逻辑删除 UPDATE SET deleted=1
         //    - 收藏（Favorite 无 @TableLogic）：delete 是真正的物理删除
         LambdaQueryWrapper<Comment> commentWrapper = new LambdaQueryWrapper<>();
         commentWrapper.eq(Comment::getProductId, id);
         int deletedComments = commentMapper.delete(commentWrapper);
-
+    
         LambdaQueryWrapper<Favorite> favoriteWrapper = new LambdaQueryWrapper<>();
         favoriteWrapper.eq(Favorite::getProductId, id);
         int deletedFavorites = favoriteMapper.delete(favoriteWrapper);
-
-        // 5. 清除缓存：商品已删除，缓存必须失效，否则用户还能看到已删除的商品
+    
+        // 6. 清除缓存：商品已删除，缓存必须失效，否则用户还能看到已删除的商品
         evictProductCache(id);
-
+    
         log.info("删除商品成功：productId={}, 同步清理留言{}条、收藏{}条", id, deletedComments, deletedFavorites);
     }
 
@@ -409,12 +429,16 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         if (product == null) {
             // 缓存空值（防穿透）：存入 "NULL" 标记，过期时间较短（5分钟）
             // 这样短时间内重复请求同一个不存在的 ID，不会再穿透到 MySQL
-            stringRedisTemplate.opsForValue().set(
-                    cacheKey,
-                    RedisConstants.PRODUCT_NULL_VALUE,
-                    Duration.ofMinutes(RedisConstants.PRODUCT_NULL_TTL)
-            );
-            log.info("商品不存在，缓存空值防穿透：productId={}", id);
+            cacheNullSafely(cacheKey, id);
+            throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
+        }
+
+        // ===== 第 3.5 步：公开详情只允许查看在售商品（安全关键）=====
+        // 公开接口若不检查状态，攻击者可通过枚举 ID 看到待审核/已驳回/下架/锁定商品及其审核备注。
+        // 这里统一报 PRODUCT_NOT_FOUND（而非“商品不可用”），避免暴露商品是否存在，防止枚举探测。
+        // 卖家/管理员查看非在售商品请走专用接口（getMyProductById / 管理员详情）。
+        if (product.getStatus() == null || product.getStatus() != ProductStatus.ON_SALE) {
+            log.debug("公开详情拒绝非在售商品：productId={}, status={}", id, product.getStatus());
             throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
         }
 
@@ -448,6 +472,56 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         }
 
         return vo;
+    }
+
+    // ==================== 卖家/管理员商品详情 ====================
+
+    /**
+     * 卖家查看自己的商品详情（任意状态，含审核备注）
+     *
+     * <p><b>和公开详情 getProductById 的区别：</b></p>
+     * <ul>
+     *   <li>getProductById：公开接口，只能看别人的在售商品，不走这里</li>
+     *   <li>getMyProductById：需登录 + 校验是本人，可看自己任意状态的商品
+     *       （包括待审核/已驳回），并能看到审核备注（知道为何被驳回）</li>
+     * </ul>
+     *
+     * <p>不走缓存：卖家查看频率低，且需要实时状态和审核备注，缓存反而会造成延迟。</p>
+     *
+     * @param id 商品 ID
+     * @return 商品详情（含审核备注）
+     */
+    @Override
+    public ProductVO getMyProductById(Long id) {
+        log.info("卖家查看商品详情：productId={}", id);
+        Product product = this.getById(id);
+        if (product == null) {
+            throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
+        }
+        // 校验权限：只有商品本人能看自己的（任意状态）详情
+        checkOwnership(product);
+        User seller = userMapper.selectById(product.getSellerId());
+        return convertToProductVO(product, seller);
+    }
+
+    /**
+     * 管理员查看商品详情（任意状态，含审核备注，不校验归属）
+     *
+     * <p>管理员需要查看平台任何商品（包括待审核/已驳回/下架）以进行审核和处理，
+     * 所以不限制状态也不校验归属。权限由 Controller 层的 @RequireRole(1) 保证。</p>
+     *
+     * @param id 商品 ID
+     * @return 商品详情
+     */
+    @Override
+    public ProductVO getProductByIdForAdmin(Long id) {
+        log.info("管理员查看商品详情：productId={}", id);
+        Product product = this.getById(id);
+        if (product == null) {
+            throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
+        }
+        User seller = userMapper.selectById(product.getSellerId());
+        return convertToProductVO(product, seller);
     }
 
     // ==================== 商品列表（分页 + 筛选 + 排序）====================
@@ -595,49 +669,72 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
     // ==================== 修改商品状态（上架/下架）====================
 
     /**
-     * 修改商品状态（仅支持上架/下架切换）
+     * 修改商品状态（卖家主动下架 / 重新提交审核）
      *
-     * <p>状态值含义：0=下架（不在列表中显示）、1=在售（正常显示）</p>
+     * <p><b>为什么不能卖家想设什么状态就设什么？（安全关键）</b><br>
+     * 旧实现只校验目标值是 0 或 1，不看当前状态，导致卖家可以把
+     * “待审核(4)”的商品直接改成“在售(1)”，一脚跨过管理员审核。
+     * 现在改为“状态转换白名单”：只有明确允许的 from→to 组合才能执行。</p>
      *
-     * <p>使用场景：</p>
+     * <p><b>允许的状态转换（卖家侧）：</b></p>
      * <ul>
-     *   <li>卖家主动下架 → status=0</li>
-     *   <li>卖家重新上架 → status=1</li>
+     *   <li>ON_SALE(1) → OFF_SALE(0)：卖家主动下架</li>
+     *   <li>OFF_SALE(0) → PENDING_REVIEW(4)：下架后重新提交审核</li>
+     *   <li>REJECTED(5) → PENDING_REVIEW(4)：被驳回后修改重新提交审核</li>
      * </ul>
      *
-     * <p><b>注意：</b>此接口只允许设置 0（下架）和 1（上架）。
-     * "已售"状态（status=3）由订单确认流程自动设置，不允许卖家手动标记，
-     * 防止卖家在没有真实交易的情况下把商品标记为已售来逃避交易。</p>
+     * <p><b>为什么重新上架要走审核（不能 OFF_SALE → ON_SALE）？</b><br>
+     * 如果允许直接重新上架，卖家可以“发布→审核通过→下架→改成违规内容→重新上架”绕过审核。
+     * 所以任何重新上架都必须重新走审核流程。</p>
+     *
+     * <p><b>为什么用条件更新？</b><br>
+     * UPDATE ... WHERE id=? AND status=当前状态。防止并发下两个请求同时改状态，
+     * 只有第一个能成功（影响行数=1），第二个影响行数=0 会被拒绝。</p>
      *
      * @param id     商品 ID
-     * @param status 新状态值（0=下架 / 1=上架）
+     * @param status 目标状态（0=下架 / 4=重新提交审核）
      */
     @Override
     public void updateStatus(Long id, Integer status) {
-        log.info("修改商品状态：productId={}, status={}", id, status);
+        log.info("修改商品状态：productId={}, targetStatus={}", id, status);
         // 1. 查商品是否存在
         Product product = this.getById(id);
         if (product == null) {
             throw new BusinessException(ResultCode.PRODUCT_NOT_FOUND);
         }
-
+    
         // 2. 校验权限：只有本人能改自己商品的状态
         checkOwnership(product);
-
-        // 3. 校验状态值合法性（只允许上架和下架，防止前端传无效值）
-        if (status == null || (status != ProductStatus.OFF_SALE && status != ProductStatus.ON_SALE)) {
-            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "只能设置为上架或下架");
+    
+        // 3. 校验状态转换是否合法（白名单）
+        //    只有明确允许的 from→to 组合才放行，其余一律拒绝
+        Integer current = product.getStatus();
+        boolean legalTransition =
+                (current != null && current == ProductStatus.ON_SALE && status != null && status == ProductStatus.OFF_SALE)
+                || (current != null && current == ProductStatus.OFF_SALE && status != null && status == ProductStatus.PENDING_REVIEW)
+                || (current != null && current == ProductStatus.REJECTED && status != null && status == ProductStatus.PENDING_REVIEW);
+        if (!legalTransition) {
+            log.warn("非法的商品状态变更：productId={}, current={}, target={}", id, current, status);
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "不允许的状态变更");
         }
-
-        // 4. 更新状态并写回数据库
-        product.setStatus(status);
-        this.updateById(product);
-
-        // 5. 清除缓存：状态变了（上架/下架），缓存必须失效
-        //    否则商品下架后，用户通过缓存还能看到它
+    
+        // 4. 条件更新：WHERE id=? AND status=当前状态，防并发篡改
+        //    重新提交审核时顺便清空旧的驳回原因（避免残留上一次驳回的过时备注）
+        boolean updated = this.lambdaUpdate()
+                .eq(Product::getId, id)
+                .eq(Product::getStatus, current)
+                .set(Product::getStatus, status)
+                .set(status == ProductStatus.PENDING_REVIEW, Product::getReviewRemark, null)
+                .update();
+        if (!updated) {
+            // 影响行数=0：状态在查询后被并发修改了，拒绝本次操作
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态已变更，请刷新后重试");
+        }
+    
+        // 5. 清除缓存：状态变了，缓存必须失效
         evictProductCache(id);
-
-        log.info("修改商品状态成功：productId={}, status={}", id, status);
+    
+        log.info("修改商品状态成功：productId={}, {} → {}", id, current, status);
     }
 
     // ==================== 我的商品 ====================
@@ -724,19 +821,29 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             throw new BusinessException(ResultCode.PRODUCT_NOT_PENDING_REVIEW);
         }
 
-        // 3. 根据审核结果设置状态：通过 → 上架，不通过 → 下架
-        int newStatus = approved ? ProductStatus.ON_SALE : ProductStatus.OFF_SALE;
-        product.setStatus(newStatus);
+        // 3. 根据审核结果设置状态：通过 → 上架，不通过 → 已驳回
+        //    驳回用专门的 REJECTED 状态（而非 OFF_SALE），让卖家能区分“被驳回”和“自己下架”
+        int newStatus = approved ? ProductStatus.ON_SALE : ProductStatus.REJECTED;
+        String reviewRemark = approved ? null : (StringUtils.hasText(remark) ? remark : "");
 
-        // 4. 记录审核备注：驳回时保存原因（卖家可见），通过时清空备注
-        //     StringUtils.hasText 判断：驳回但没填原因时存空字符串，避免残留上一次驳回的旧原因
-        product.setReviewRemark(approved ? null : (StringUtils.hasText(remark) ? remark : ""));
-        this.updateById(product);
+        // 4. 条件更新：WHERE id=? AND status=PENDING_REVIEW，防并发审核
+        //    两个管理员同时审核同一商品时，只有第一个能成功（影响行数=1），
+        //    后提交的因 status 已变影响行数=0，会被拒绝，不会覆盖前一个人的结果。
+        boolean updated = this.lambdaUpdate()
+                .eq(Product::getId, id)
+                .eq(Product::getStatus, ProductStatus.PENDING_REVIEW)
+                .set(Product::getStatus, newStatus)
+                .set(Product::getReviewRemark, reviewRemark)
+                .update();
+        if (!updated) {
+            // 影响行数=0：商品状态在查询后已被并发修改（如已被另一个管理员审核）
+            throw new BusinessException(ResultCode.PRODUCT_NOT_PENDING_REVIEW);
+        }
 
         // 5. 清除缓存（状态变了，缓存必须失效）
         evictProductCache(id);
 
-        log.info("审核商品完成：productId={}, 结果={}", id, approved ? "通过上架" : "不通过下架");
+        log.info("审核商品完成：productId={}, 结果={}", id, approved ? "通过上架" : "不通过驳回");
     }
 
     // ==================== 管理员：商品列表 ====================
@@ -858,6 +965,32 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             // Redis 异常不影响业务主流程：MySQL 数据已经更新成功，
             // 缓存最迟在 TTL 到期后自然失效，不会造成永久数据不一致
             log.warn("清除商品缓存失败（不影响数据正确性，缓存将自然过期）：productId={}", productId, e);
+        }
+    }
+
+    /**
+     * 安全地写入空值缓存（防穿透），Redis 异常时降级不抛出
+     *
+     * <p><b>为什么要单独封装并加 try-catch？</b><br>
+     * 商品不存在时本应返回“商品不存在”（PRODUCT_NOT_FOUND）。但如果此时 Redis
+     * 正好故障，直接写空值会抛出连接异常，把本来的“商品不存在”变成 500 错误，
+     * 误导用户。空值缓存只是优化（减少穿透），写入失败不应该影响正常的业务返回。
+     * 所以这里降级处理：写不进去就算了，下次请求再查一次 MySQL 也无妨。</p>
+     *
+     * @param cacheKey 缓存 key
+     * @param productId 商品 ID（仅用于日志）
+     */
+    private void cacheNullSafely(String cacheKey, Long productId) {
+        try {
+            stringRedisTemplate.opsForValue().set(
+                    cacheKey,
+                    RedisConstants.PRODUCT_NULL_VALUE,
+                    Duration.ofMinutes(RedisConstants.PRODUCT_NULL_TTL)
+            );
+            log.info("商品不存在，缓存空值防穿透：productId={}", productId);
+        } catch (Exception e) {
+            // 空值缓存写入失败不影响“商品不存在”的正常返回，只记警告日志
+            log.warn("空值缓存写入失败（不影响正常返回）：productId={}", productId, e);
         }
     }
 

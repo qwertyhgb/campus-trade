@@ -10,6 +10,7 @@ import com.ming.campustrade.dto.UserRegisterDTO;
 import com.ming.campustrade.entity.User;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
+import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.LoginVO;
 import com.ming.campustrade.vo.UserVO;
 import org.junit.jupiter.api.BeforeEach;
@@ -22,6 +23,7 @@ import org.mockito.Captor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.HashOperations;
+import org.springframework.data.redis.core.SetOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
@@ -121,14 +123,49 @@ class UserServiceImplTest {
     class GetUserById {
 
         @Test
-        @DisplayName("成功返回用户 VO，不暴露密码")
-        void shouldReturnUser() {
-            when(userMapper.selectById(1L)).thenReturn(createUser(1L, "testuser", "pwd", 1, 0));
+        @DisplayName("本人查看自己：返回完整信息（含用户名）")
+        void shouldReturnFullInfoWhenSelf() {
+            // 设置当前登录用户为 id=1（查自己）
+            UserVO self = new UserVO();
+            self.setId(1L);
+            self.setRole(0);
+            UserHolder.saveUser(self);
+            try {
+                when(userMapper.selectById(1L)).thenReturn(createUser(1L, "testuser", "pwd", 1, 0));
 
-            UserVO vo = userService.getUserById(1L);
+                UserVO vo = userService.getUserById(1L);
 
-            assertThat(vo.getId()).isEqualTo(1L);
-            assertThat(vo.getUsername()).isEqualTo("testuser");
+                assertThat(vo.getId()).isEqualTo(1L);
+                assertThat(vo.getUsername()).isEqualTo("testuser"); // 本人可见完整信息
+            } finally {
+                UserHolder.removeUser();
+            }
+        }
+
+        @Test
+        @DisplayName("普通用户查看他人：仅返回公开信息（不含用户名/手机号）")
+        void shouldReturnPublicInfoWhenOther() {
+            // 设置当前登录用户为 id=2（查别人 id=1）
+            UserVO other = new UserVO();
+            other.setId(2L);
+            other.setRole(0);
+            UserHolder.saveUser(other);
+            try {
+                User target = createUser(1L, "testuser", "pwd", 1, 0);
+                target.setNickname("昵称");
+                target.setPhone("13800138000");
+                when(userMapper.selectById(1L)).thenReturn(target);
+
+                UserVO vo = userService.getUserById(1L);
+
+                assertThat(vo.getId()).isEqualTo(1L);
+                assertThat(vo.getNickname()).isEqualTo("昵称"); // 公开字段可见
+                assertThat(vo.getUsername()).isNull();           // 用户名不暴露
+                assertThat(vo.getPhone()).isNull();              // 手机号不暴露
+                assertThat(vo.getRole()).isNull();               // 角色不暴露
+            } finally {
+                UserHolder.removeUser();
+            }
         }
 
         @Test
@@ -263,6 +300,9 @@ class UserServiceImplTest {
 
             HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
             when(stringRedisTemplate.opsForHash()).thenReturn(hashOps);
+            // 登录还会维护 token 反向索引（opsForSet）
+            SetOperations<String, String> setOps = mock(SetOperations.class);
+            when(stringRedisTemplate.opsForSet()).thenReturn(setOps);
 
             LoginVO loginVO = userService.login(dto);
 
@@ -273,7 +313,10 @@ class UserServiceImplTest {
             assertThat(loginVO.getUserVO().getUsername()).isEqualTo("user1");
 
             verify(stringRedisTemplate).opsForHash();
-            verify(stringRedisTemplate).expire(anyString(), any(Duration.class));
+            // expire 调用两次：token 登录态 + token 反向索引集合
+            verify(stringRedisTemplate, times(2)).expire(anyString(), any(Duration.class));
+            // token 被加入反向索引
+            verify(setOps).add(anyString(), any());
         }
 
         @Test
@@ -321,18 +364,31 @@ class UserServiceImplTest {
     class Logout {
 
         @Test
-        @DisplayName("成功退出，删除 Redis token")
+        @SuppressWarnings("unchecked")
+        @DisplayName("成功退出，删除 Redis token 并清理反向索引")
         void shouldLogoutSuccessfully() {
+            // logout 会先从 Hash 读出用户 ID，用于清理反向索引
+            HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
+            when(stringRedisTemplate.opsForHash()).thenReturn(hashOps);
+            when(hashOps.get(anyString(), any())).thenReturn("1");
+            SetOperations<String, String> setOps = mock(SetOperations.class);
+            when(stringRedisTemplate.opsForSet()).thenReturn(setOps);
             when(stringRedisTemplate.delete(anyString())).thenReturn(true);
 
             userService.logout("some-token");
 
             verify(stringRedisTemplate).delete(RedisConstants.LOGIN_USER_KEY + "some-token");
+            // 从反向索引中移除该 token
+            verify(setOps).remove(eq(RedisConstants.LOGIN_USER_TOKENS_KEY + "1"), eq("some-token"));
         }
 
         @Test
+        @SuppressWarnings("unchecked")
         @DisplayName("带 Bearer 前缀时正确去除并删除 token")
         void shouldStripBearerPrefix() {
+            HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
+            when(stringRedisTemplate.opsForHash()).thenReturn(hashOps);
+            when(hashOps.get(anyString(), any())).thenReturn(null); // 读不到 ID 则跳过反向索引清理
             when(stringRedisTemplate.delete(anyString())).thenReturn(true);
 
             userService.logout("Bearer my-token-123");
@@ -359,8 +415,12 @@ class UserServiceImplTest {
         }
 
         @Test
+        @SuppressWarnings("unchecked")
         @DisplayName("token 已过期（Redis 中不存在）时抛出 UNAUTHORIZED")
         void shouldThrowWhenTokenAlreadyExpired() {
+            HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
+            when(stringRedisTemplate.opsForHash()).thenReturn(hashOps);
+            when(hashOps.get(anyString(), any())).thenReturn(null);
             when(stringRedisTemplate.delete(anyString())).thenReturn(false);
 
             assertThatThrownBy(() -> userService.logout("expired-token"))

@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
@@ -160,18 +161,32 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             throw new BusinessException(ResultCode.ORDER_STATUS_ERROR, "订单状态不允许确认");
         }
 
-        // 5. 更新订单状态为已确认（CONFIRMED = 1）
-        order.setStatus(OrderStatus.CONFIRMED);
-        this.updateById(order);
+        // 5. 条件更新订单状态：PENDING → CONFIRMED
+        //    用条件更新（WHERE status=PENDING）而非无条件 updateById，防止并发竞态：
+        //    如果买家同一时刻取消了订单（status 已变为 CANCELED），这条 UPDATE 影响行数=0，
+        //    不会把已取消的订单错误地改成已确认。只有第一个到达的请求能成功。
+        boolean orderUpdated = this.lambdaUpdate()
+                .eq(Order::getId, id)
+                .eq(Order::getStatus, OrderStatus.PENDING)
+                .set(Order::getStatus, OrderStatus.CONFIRMED)
+                .update();
+        if (!orderUpdated) {
+            // 影响行数=0：订单状态已被并发修改（如被取消），拒绝确认
+            throw new BusinessException(ResultCode.ORDER_STATUS_ERROR, "订单状态已变更，无法确认");
+        }
 
-        // 6. 创建一个新的 Product 实体对象并只设置 ID 与 Status
-        // 最佳实践：只往新对象中放入待更新的列，这样 MyBatis-Plus 会用动态 SQL 只更新这些有值字段，不用写全量 SQL，效率极高
-        Product product = new Product();
-        product.setId(order.getProductId());
-        
-        // 7. 更新商品状态为已售出（SOLD = 3）
-        product.setStatus(ProductStatus.SOLD);
-        productMapper.updateById(product);
+        // 6. 条件更新商品状态：LOCKED → SOLD
+        //    同样用条件更新，只有商品仍为“锁定”时才改为“已售”。
+        //    如果商品状态异常（不是 LOCKED），影响行数=0，抛异常触发事务回滚，
+        //    连带撤销第 5 步的订单确认，保证两表数据一致。
+        int productUpdated = productMapper.update(null,
+                new LambdaUpdateWrapper<Product>()
+                        .eq(Product::getId, order.getProductId())
+                        .eq(Product::getStatus, ProductStatus.LOCKED)
+                        .set(Product::getStatus, ProductStatus.SOLD));
+        if (productUpdated == 0) {
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态异常，确认失败");
+        }
         log.info("确认订单成功：orderId={}, productId={}", id, order.getProductId());
     }
 
@@ -206,15 +221,28 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             throw new BusinessException(ResultCode.ORDER_STATUS_ERROR, "订单状态不允许取消");
         }
 
-        // 4. 更新订单状态为已取消（CANCELED = 2）
-        order.setStatus(OrderStatus.CANCELED);
-        this.updateById(order);
+        // 4. 条件更新订单状态：PENDING → CANCELED
+        //    用条件更新防止并发竞态：如果卖家同一时刻确认了订单（status 已变为 CONFIRMED），
+        //    这条 UPDATE 影响行数=0，不会把已确认的订单错误地取消。
+        boolean orderUpdated = this.lambdaUpdate()
+                .eq(Order::getId, id)
+                .eq(Order::getStatus, OrderStatus.PENDING)
+                .set(Order::getStatus, OrderStatus.CANCELED)
+                .update();
+        if (!orderUpdated) {
+            throw new BusinessException(ResultCode.ORDER_STATUS_ERROR, "订单状态已变更，无法取消");
+        }
 
-        // 5. 释放锁定商品，将商品状态改回“在售（ON_SALE = 1）”，使其他同学能够继续浏览购买
-        Product product = new Product();
-        product.setId(order.getProductId());
-        product.setStatus(ProductStatus.ON_SALE);
-        productMapper.updateById(product);
+        // 5. 条件释放商品：LOCKED → ON_SALE，让其他同学可以继续购买
+        //    只有商品仍为“锁定”时才释放；若状态异常则抛异常回滚整个事务（连带撤销订单取消）
+        int productUpdated = productMapper.update(null,
+                new LambdaUpdateWrapper<Product>()
+                        .eq(Product::getId, order.getProductId())
+                        .eq(Product::getStatus, ProductStatus.LOCKED)
+                        .set(Product::getStatus, ProductStatus.ON_SALE));
+        if (productUpdated == 0) {
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态异常，取消失败");
+        }
         log.info("取消订单成功：orderId={}, productId={}", id, order.getProductId());
     }
 
@@ -420,6 +448,59 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         voPage.setSize(orderPage.getSize());
 
         return voPage;
+    }
+
+    // ==================== 定时任务：超时自动取消 ====================
+
+    /**
+     * 超时自动取消单笔订单（每笔独立事务）
+     *
+     * <p><b>为什么用 REQUIRES_NEW？</b><br>
+     * 定时任务会逐笔调用本方法。每笔订单需要一个独立事务：
+     * “订单取消 + 商品释放”两步要么都成功要么都回滚，
+     * 且某一笔失败不能影响其他订单。REQUIRES_NEW 会为每次调用开启一个全新事务，
+     * 与调用方（定时任务）的事务隔离。</p>
+     *
+     * <p><b>为什么本方法必须放在独立的 Spring Bean（OrderServiceImpl）而不是定时任务类里？</b><br>
+     * Spring 的 @Transactional 基于 AOP 代理实现。如果在同一个类内部调用
+     * 带 @Transactional 的方法（this.xxx()），会绕过代理导致事务失效。
+     * 定时任务类（OrderTimeoutTask）通过注入的 OrderService 调用本方法，
+     * 是跨 Bean 调用，代理生效，事务才会真正起作用。</p>
+     *
+     * @param order 超时订单
+     * @return true=已成功取消；false=订单状态已变更（跳过）
+     */
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public boolean autoCancelTimeoutOrder(Order order) {
+        // 1. 条件更新订单：PENDING → CANCELED
+        //    只有订单仍为“待确认”时才取消；若卖家已在超时前确认（status 变了），影响行数=0
+        boolean orderUpdated = this.lambdaUpdate()
+                .eq(Order::getId, order.getId())
+                .eq(Order::getStatus, OrderStatus.PENDING)
+                .set(Order::getStatus, OrderStatus.CANCELED)
+                .update();
+        if (!orderUpdated) {
+            // 订单状态已变更（如已被确认），无需取消，返回 false 让调用方跳过
+            log.info("超时取消跳过，订单状态已变更：orderId={}, orderNo={}", order.getId(), order.getOrderNo());
+            return false;
+        }
+
+        // 2. 条件释放商品：LOCKED → ON_SALE
+        //    若商品状态异常（不是 LOCKED），影响行数=0，抛异常触发本笔事务回滚，
+        //    连带撤销第 1 步的订单取消，避免“订单已取消但商品仍锁定”的不一致
+        int productUpdated = productMapper.update(null,
+                new LambdaUpdateWrapper<Product>()
+                        .eq(Product::getId, order.getProductId())
+                        .eq(Product::getStatus, ProductStatus.LOCKED)
+                        .set(Product::getStatus, ProductStatus.ON_SALE));
+        if (productUpdated == 0) {
+            throw new BusinessException(ResultCode.PRODUCT_STATUS_ERROR, "商品状态异常，超时取消回滚");
+        }
+
+        log.info("超时订单已自动取消：orderId={}, orderNo={}, productId={}",
+                order.getId(), order.getOrderNo(), order.getProductId());
+        return true;
     }
     
     /**

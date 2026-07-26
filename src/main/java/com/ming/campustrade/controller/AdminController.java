@@ -19,8 +19,11 @@ import com.ming.campustrade.vo.ProductVO;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.validation.annotation.Validated;
 
 /**
  * 管理员后台控制器 —— 处理商品审核、订单管理、用户封禁等后台 HTTP 请求。
@@ -46,6 +49,7 @@ import lombok.extern.slf4j.Slf4j;
 @RestController
 @RequestMapping("/admin")
 @RequireRole(1) // 整个控制器都需要管理员权限
+@Validated // 启用方法参数（@RequestParam/@PathVariable）上的约束校验（如 @Min/@Max）
 public class AdminController {
 
     private final ProductService productService;
@@ -62,6 +66,21 @@ public class AdminController {
     }
 
     // ==================== 商品审核 ====================
+
+    /**
+     * 管理员查看商品详情（任意状态，含审核备注）。
+     *
+     * <p>管理员需查看任何商品（包括待审核/已驳回/下架）以进行审核和处理。</p>
+     *
+     * @param id 商品ID（路径变量）
+     * @return 商品详细信息
+     */
+    @Operation(summary = "商品详情（管理员）", description = "管理员查看任意状态的商品详情（含审核备注）")
+    @GetMapping("/product/{id}")
+    public Result<ProductVO> getProductById(@Parameter(description = "商品ID") @PathVariable Long id) {
+        log.info("管理员查看商品详情：productId={}", id);
+        return Result.success(productService.getProductByIdForAdmin(id));
+    }
 
     /**
      * 审核商品（通过上架 / 不通过下架）。
@@ -99,9 +118,9 @@ public class AdminController {
      */
     @Operation(summary = "商品列表（管理员）", description = "分页查询所有状态的商品，支持按状态筛选（含待审核）")
     @GetMapping("/product/list")
-    public Result<IPage<ProductVO>> listProducts(@Parameter(description = "状态筛选：0下架 1在售 2锁定 3已售 4待审核，不传查全部") @RequestParam(required = false) Integer status,
-                                                 @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") Integer pageNo,
-                                                 @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") Integer pageSize) {
+    public Result<IPage<ProductVO>> listProducts(@Parameter(description = "状态筛选：0下架 1在售 2锁定 3已售 4待审核 5已驳回，不传查全部") @RequestParam(required = false) Integer status,
+                                                 @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+                                                 @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer pageSize) {
         log.info("管理员查询商品列表：status={}, pageNo={}, pageSize={}", status, pageNo, pageSize);
         return Result.success(productService.listProductsForAdmin(status, pageNo, pageSize));
     }
@@ -122,8 +141,8 @@ public class AdminController {
     @Operation(summary = "订单列表（管理员）", description = "分页查询平台全部订单，支持按状态筛选")
     @GetMapping("/order/list")
     public Result<IPage<OrderVO>> listOrders(@Parameter(description = "状态筛选：0待确认 1已确认 2已取消，不传查全部") @RequestParam(required = false) Integer status,
-                                             @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") Integer pageNo,
-                                             @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") Integer pageSize) {
+                                             @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+                                             @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer pageSize) {
         log.info("管理员查询订单列表：status={}, pageNo={}, pageSize={}", status, pageNo, pageSize);
         return Result.success(orderService.listOrdersForAdmin(status, pageNo, pageSize));
     }

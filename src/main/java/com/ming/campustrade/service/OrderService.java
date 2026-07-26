@@ -76,4 +76,15 @@ public interface OrderService extends IService<Order> {
      * @return 分页结果，含买卖双方昵称等关联信息
      */
     IPage<OrderVO> listOrdersForAdmin(Integer status, Integer pageNo, Integer pageSize);
+
+    /**
+     * 超时自动取消单笔订单（定时任务调用，每笔独立事务）。
+     *
+     * <p>用条件更新把订单 PENDING→CANCELED、商品 LOCKED→ON_SALE，两步在同一事务内，
+     * 任一步失败则整笔回滚。由定时任务逐笔调用，一笔失败不影响其他订单。</p>
+     *
+     * @param order 超时订单
+     * @return true=已成功取消；false=订单状态已变更（如已被确认），跳过
+     */
+    boolean autoCancelTimeoutOrder(Order order);
 }

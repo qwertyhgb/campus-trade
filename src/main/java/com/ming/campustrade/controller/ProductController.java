@@ -23,8 +23,11 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.validation.annotation.Validated;
 
 /**
  * 商品管理控制器 —— 处理商品的发布、编辑、删除、查询、上下架等 HTTP 请求。
@@ -66,6 +69,7 @@ import lombok.extern.slf4j.Slf4j;
 @Tag(name = "商品管理", description = "商品的发布、编辑、删除、查询、上下架等操作")
 @RestController
 @RequestMapping("/product")
+@Validated // 启用方法参数（@RequestParam/@PathVariable）上的约束校验（如 @Min/@Max）
 public class ProductController {
 
     private final ProductService productService;
@@ -147,12 +151,28 @@ public class ProductController {
      * @param id 商品ID（路径变量）
      * @return 商品详细信息（含卖家信息、分类名称等）
      */
-    @Operation(summary = "查询商品详情", description = "根据商品ID获取商品详细信息（公开接口）")
+    @Operation(summary = "查询商品详情", description = "根据商品ID获取商品详细信息（公开接口，仅返回在售商品）")
     @PublicApi
     @GetMapping("/{id}")
     public Result<ProductVO> getById(@Parameter(description = "商品ID") @PathVariable Long id) {
         log.info("查询商品详情：productId={}", id);
         return Result.success(productService.getProductById(id));
+    }
+
+    /**
+     * 卖家查看自己的商品详情（需要登录，仅本人）。
+     *
+     * <p>与公开详情的区别：这里可查看自己任意状态的商品（包括待审核/已驳回），
+     * 并能看到审核备注（知道为何被驳回）。路径 /product/my/{id} 与公开详情 /product/{id} 区分。</p>
+     *
+     * @param id 商品ID（路径变量）
+     * @return 商品详细信息（含审核备注）
+     */
+    @Operation(summary = "我的商品详情", description = "卖家查看自己任意状态的商品详情（含审核备注）")
+    @GetMapping("/my/{id}")
+    public Result<ProductVO> getMyProductById(@Parameter(description = "商品ID") @PathVariable Long id) {
+        log.info("卖家查看商品详情：productId={}", id);
+        return Result.success(productService.getMyProductById(id));
     }
 
     /**
@@ -169,7 +189,7 @@ public class ProductController {
     @Operation(summary = "商品列表查询", description = "根据条件分页查询在售商品列表（公开接口），支持按分类、关键词等筛选")
     @PublicApi
     @GetMapping("/list")
-    public Result<IPage<ProductVO>> list(ProductQueryDTO productQueryDTO) {
+    public Result<IPage<ProductVO>> list(@Valid ProductQueryDTO productQueryDTO) {
         log.info("商品列表查询：keyword={}, categoryId={}, pageNo={}, pageSize={}",
                 productQueryDTO.getKeyword(), productQueryDTO.getCategoryId(),
                 productQueryDTO.getPageNo(), productQueryDTO.getPageSize());
@@ -177,21 +197,24 @@ public class ProductController {
     }
 
     /**
-     * 修改商品状态 —— 上架/下架（需要登录，且只能操作自己的商品）。
+     * 修改商品状态 —— 主动下架 / 重新提交审核（需要登录，且只能操作自己的商品）。
      *
      * <p>{@code @RequestParam} 从 URL 查询参数中取值：
      * 例如请求 POST /product/42/status?status=0，则 id=42, status=0（下架）。</p>
      * <p>为什么用 POST 而不是 PUT？因为这是一个「动作」而非「替换资源」，
      * 用 POST + 子路径 /status 语义更清晰。</p>
      *
+     * <p><b>允许的状态转换：</b>在售→下架(0)、下架/已驳回→重新提交审核(4)。
+     * 重新上架必须重新走审核，不能直接设为在售。</p>
+     *
      * @param id     商品ID（路径变量）
-     * @param status 目标状态：0=下架，1=上架（查询参数）
+     * @param status 目标状态：0=下架，4=重新提交审核（查询参数）
      * @return 统一响应结果（无数据体）
      */
-    @Operation(summary = "修改商品状态", description = "卖家上下架商品，status=0 下架，status=1 上架")
+    @Operation(summary = "修改商品状态", description = "卖家主动下架(status=0)或重新提交审核(status=4)，重新上架需重新审核")
     @PostMapping("/{id}/status")
     public Result<Void> updateStatus(@Parameter(description = "商品ID") @PathVariable Long id,
-                                      @Parameter(description = "状态：0下架 1上架") @RequestParam Integer status) {
+                                      @Parameter(description = "状态：0下架 4重新提交审核") @RequestParam Integer status) {
         log.info("修改商品状态：productId={}, status={}", id, status);
         productService.updateStatus(id, status);
         log.info("修改商品状态成功：productId={}, status={}", id, status);
@@ -214,8 +237,8 @@ public class ProductController {
      */
     @Operation(summary = "我的商品列表", description = "查看当前登录卖家发布的全部商品（含下架、在售、已售），分页返回")
     @GetMapping("/my")
-    public Result<IPage<ProductVO>> myProducts(@Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") Integer pageNo,
-                                                @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") Integer pageSize) {
+    public Result<IPage<ProductVO>> myProducts(@Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+                                                @Parameter(description = "每页条数") @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer pageSize) {
         log.info("查询我的商品列表：pageNo={}, pageSize={}", pageNo, pageSize);
         return Result.success(productService.getMyProducts(pageNo, pageSize));
     }

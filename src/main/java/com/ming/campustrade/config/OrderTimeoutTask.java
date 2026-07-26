@@ -7,13 +7,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.ming.campustrade.common.constant.OrderStatus;
-import com.ming.campustrade.common.constant.ProductStatus;
 import com.ming.campustrade.entity.Order;
-import com.ming.campustrade.entity.Product;
 import com.ming.campustrade.mapper.OrderMapper;
-import com.ming.campustrade.mapper.ProductMapper;
+import com.ming.campustrade.service.OrderService;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -50,14 +47,19 @@ public class OrderTimeoutTask {
     private final static int TIMEOUT_MINUTES = 30;
 
     private final OrderMapper orderMapper;
-    private final ProductMapper productMapper;
+    private final OrderService orderService;
 
     /**
-     * 构造器注入：Spring 启动时自动把 OrderMapper 和 ProductMapper 的实例传进来。
+     * 构造器注入。
+     *
+     * <p>注入 {@link OrderService} 而非直接用 Mapper 做取消：因为“订单取消+商品释放”
+     * 需要在同一个事务里保证原子性，而事务方法（autoCancelTimeoutOrder，REQUIRES_NEW）
+     * 放在 OrderServiceImpl 中。本类通过注入的 OrderService 跨 Bean 调用它，
+     * Spring AOP 代理才会生效、事务才真正起作用（同类内部调用会绕过代理）。</p>
      */
-    public OrderTimeoutTask(OrderMapper orderMapper, ProductMapper productMapper) {
+    public OrderTimeoutTask(OrderMapper orderMapper, OrderService orderService) {
         this.orderMapper = orderMapper;
-        this.productMapper = productMapper;
+        this.orderService = orderService;
     }
 
     /**
@@ -112,46 +114,31 @@ public class OrderTimeoutTask {
 
         log.info("检测到 {} 笔超时未确认订单，开始自动取消（超时阈值={}分钟）", timeoutOrders.size(), TIMEOUT_MINUTES);
 
-        // ===== 第 3 步：逐笔处理（每笔独立 try-catch，一笔失败不影响其他）=====
+        // ===== 第 3 步：逐笔处理（每笔调用独立事务方法，一笔失败不影响其他）=====
+        // 调用 orderService.autoCancelTimeoutOrder（跨 Bean，REQUIRES_NEW 事务生效）：
+        //   - 返回 true：成功取消
+        //   - 返回 false：订单状态已变更（如已被确认），跳过
+        //   - 抛异常：本笔事务已回滚，记入失败，继续下一笔
         int successCount = 0;
+        int skipCount = 0;
         int failCount = 0;
 
         for (Order order : timeoutOrders) {
             try {
-                // 3a. 条件更新取消订单：只有订单仍为 PENDING 时才取消
-                // 等价 SQL: UPDATE `order` SET status = 2 WHERE id = ? AND status = 0
-                // 如果在查询和取消之间卖家已确认了订单（status 变为 1），
-                // 这条 UPDATE 影响行数 = 0，不会误伤已确认的订单
-                LambdaUpdateWrapper<Order> orderUpdate = new LambdaUpdateWrapper<>();
-                orderUpdate.eq(Order::getId, order.getId())
-                        .eq(Order::getStatus, OrderStatus.PENDING)  // 关键：只取消仍为“待确认”的
-                        .set(Order::getStatus, OrderStatus.CANCELED);
-                int updated = orderMapper.update(null, orderUpdate);
-
-                if (updated == 0) {
-                    // 订单状态已变（卖家在超时前确认了），跳过不处理
-                    log.info("订单状态已变更，跳过取消：orderId={}, orderNo={}", order.getId(), order.getOrderNo());
-                    continue;
+                boolean cancelled = orderService.autoCancelTimeoutOrder(order);
+                if (cancelled) {
+                    successCount++;
+                } else {
+                    skipCount++;
                 }
-
-                // 3b. 释放商品：状态 LOCKED → ON_SALE，让其他买家可以重新购买
-                //     只 new 一个 Product 并设置 id + status，updateById 只会更新这两个字段
-                Product product = new Product();
-                product.setId(order.getProductId());
-                product.setStatus(ProductStatus.ON_SALE);
-                productMapper.updateById(product);
-
-                successCount++;
-                log.info("超时订单已自动取消：orderId={}, orderNo={}, productId={}, 创建时间={}",
-                        order.getId(), order.getOrderNo(), order.getProductId(), order.getCreateTime());
             } catch (Exception e) {
-                // 单笔失败不影响其他订单：记录错误日志，继续处理下一笔
+                // 单笔失败（本笔事务已回滚）不影响其他订单：记录错误日志，继续处理下一笔
                 failCount++;
                 log.error("超时订单取消失败：orderId={}, orderNo={}, 原因={}",
                         order.getId(), order.getOrderNo(), e.getMessage(), e);
             }
         }
 
-        log.info("超时订单自动取消完成：成功 {} 笔，失败 {} 笔", successCount, failCount);
+        log.info("超时订单自动取消完成：成功 {} 笔，跳过 {} 笔，失败 {} 笔", successCount, skipCount, failCount);
     }
 }

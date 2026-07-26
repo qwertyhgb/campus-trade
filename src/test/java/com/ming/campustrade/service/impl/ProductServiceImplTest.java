@@ -339,15 +339,28 @@ class ProductServiceImplTest {
     class UpdateStatus {
 
         @Test
-        @DisplayName("成功下架商品")
+        @DisplayName("成功下架商品（在售 → 下架）")
         void shouldUpdateStatusSuccessfully() {
             when(productMapper.selectById(PRODUCT_ID)).thenReturn(createProduct(PRODUCT_ID, SELLER_ID, ProductStatus.ON_SALE));
+            // 条件更新影响行数=1（状态转换成功）
+            when(productMapper.update(isNull(), any())).thenReturn(1);
 
             productService.updateStatus(PRODUCT_ID, ProductStatus.OFF_SALE);
 
-            verify(productMapper).updateById((Product) productCaptor.capture());
-            assertThat(productCaptor.getValue().getStatus()).isEqualTo(ProductStatus.OFF_SALE);
+            verify(productMapper).update(isNull(), any());
             verify(stringRedisTemplate).delete(RedisConstants.PRODUCT_DETAIL_KEY + PRODUCT_ID); // 缓存失效
+        }
+
+        @Test
+        @DisplayName("绕过审核的状态变更被拒绝（待审核 → 在售）")
+        void shouldRejectIllegalTransition() {
+            // 商品当前为待审核，卖家试图直接改为在售（绕过审核）
+            when(productMapper.selectById(PRODUCT_ID)).thenReturn(createProduct(PRODUCT_ID, SELLER_ID, ProductStatus.PENDING_REVIEW));
+
+            assertThatThrownBy(() -> productService.updateStatus(PRODUCT_ID, ProductStatus.ON_SALE))
+                    .isInstanceOf(BusinessException.class)
+                    .hasFieldOrPropertyWithValue("code", ResultCode.PRODUCT_STATUS_ERROR.getCode());
+            verify(productMapper, never()).update(isNull(), any());
         }
 
         @Test
