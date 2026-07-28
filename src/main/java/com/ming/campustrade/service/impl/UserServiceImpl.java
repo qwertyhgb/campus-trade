@@ -7,6 +7,7 @@ import com.ming.campustrade.vo.LoginVO;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
@@ -205,7 +206,8 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         //    StringUtils.hasText() 排除了 null、空字符串、纯空白，比 != null 更严格
         user.setNickname(StringUtils.hasText(userAddDTO.getNickname()) ? userAddDTO.getNickname() : userAddDTO.getUsername());
 
-        user.setPhone(userAddDTO.getPhone());
+        // 空字符串转 null：user 表对 phone 有唯一索引，MySQL 允许多个 NULL 但不允许重复空字符串
+        user.setPhone(StringUtils.hasText(userAddDTO.getPhone()) ? userAddDTO.getPhone() : null);
         user.setStatus(1);  // 管理员新增的用户默认启用（1=启用，0=禁用）
 
         // 5. 保存到数据库
@@ -309,7 +311,8 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             user.setNickname(username);
         }
 
-        user.setPhone(userRegisterDTO.getPhone());
+        // 空字符串转 null：user 表对 phone 有唯一索引，MySQL 允许多个 NULL 但不允许重复空字符串
+        user.setPhone(StringUtils.hasText(userRegisterDTO.getPhone()) ? userRegisterDTO.getPhone() : null);
         user.setStatus(1);  // 新注册用户默认启用
         user.setRole(0);    // 新注册用户默认普通用户（0=普通用户，1=管理员）
 
@@ -545,9 +548,10 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         if (StringUtils.hasText(dto.getNickname())) {
             existUser.setNickname(dto.getNickname());
         }
-        // phone 允许传空字符串表示"清空手机号"，所以只用 != null 判断（不强制 hasText）
+        // phone：传了空字符串表示"清空手机号"，转成 null 存储
+        // 不能存空字符串 ""，因为 user 表对 phone 有唯一索引，MySQL 允许多个 NULL 但不允许重复空字符串
         if (dto.getPhone() != null) {
-            existUser.setPhone(dto.getPhone());
+            existUser.setPhone(StringUtils.hasText(dto.getPhone()) ? dto.getPhone() : null);
         }
 
         // ===== 第 3 步：写回数据库 =====
@@ -701,6 +705,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      * @throws BusinessException 用户不存在 / 目标是管理员
      */
     @Override
+    @Transactional // 封禁涉及两步写操作（改用户状态 + 批量下架商品），必须在同一事务中，防止第二步失败导致数据不一致
     public void banUser(Long id) {
         log.info("管理员封禁用户：targetUserId={}", id);
 
