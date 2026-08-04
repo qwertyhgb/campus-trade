@@ -35,4 +35,13 @@ build/
 ### Local override (contains real secrets) ###
 application-local.yaml
 application-local.yml
+
+### Teaching / personal files ###
 继续开发指导提示词.md
+Continue development guidance prompts.md
+
+### Windows reserved-name junk file (cannot be deleted normally) ###
+nul
+
+### WorkBuddy workspace memory ###
+.workbuddy/

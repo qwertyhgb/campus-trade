@@ -15,6 +15,7 @@ import com.ming.campustrade.entity.User;
 import com.ming.campustrade.mapper.OrderMapper;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
+import com.ming.campustrade.messaging.OrderTimeoutEventPublisher;
 import com.ming.campustrade.service.ProductCacheService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.UserVO;
@@ -58,6 +59,10 @@ class OrderServiceImplTest {
     @Mock
     private ProductCacheService productCacheService;
 
+    /** 订单超时消息发布器：订单 Service 单元测试只关注数据库业务，消息发送由 Mock 隔离。 */
+    @Mock
+    private OrderTimeoutEventPublisher orderTimeoutEventPublisher;
+
     private OrderServiceImpl orderService;
 
     @Captor
@@ -90,7 +95,8 @@ class OrderServiceImplTest {
         currentUser.setId(BUYER_ID);
         UserHolder.saveUser(currentUser);
 
-        orderService = new OrderServiceImpl(productMapper, userMapper, productCacheService);
+        orderService = new OrderServiceImpl(
+                productMapper, userMapper, productCacheService, orderTimeoutEventPublisher);
         Field field = CrudRepository.class.getDeclaredField("baseMapper");
         field.setAccessible(true);
         field.set(orderService, orderMapper);
@@ -120,6 +126,7 @@ class OrderServiceImplTest {
     private Order pendingOrder() {
         Order o = new Order();
         o.setId(ORDER_ID);
+        o.setOrderNo("ORD-10");
         o.setBuyerId(BUYER_ID);
         o.setSellerId(SELLER_ID);
         o.setProductId(PRODUCT_ID);
@@ -146,6 +153,12 @@ class OrderServiceImplTest {
             when(productMapper.selectById(PRODUCT_ID)).thenReturn(onSaleProduct());
             // 原子更新商品状态：update(null, updateWrapper)，第一个参数为 null 实体
             when(productMapper.update(isNull(), any())).thenReturn(1);
+            // 模拟 MySQL 自增主键回填；生产环境由 MyBatis-Plus 在 insert 后自动写入 order.id。
+            doAnswer(invocation -> {
+                Order order = invocation.getArgument(0);
+                order.setId(ORDER_ID);
+                return 1;
+            }).when(orderMapper).insert(any(Order.class));
 
             orderService.placeOrder(placeDTO());
 
@@ -156,6 +169,9 @@ class OrderServiceImplTest {
             assertThat(saved.getProductId()).isEqualTo(PRODUCT_ID);
             assertThat(saved.getStatus()).isEqualTo(OrderStatus.PENDING);
             assertThat(saved.getProductPrice()).isEqualByComparingTo("100");
+            // 没有事务代理的纯单元测试会立即执行 afterCommit 兜底分支，
+            // 因此可以验证下单成功后确实创建并发布了订单超时事件。
+            verify(orderTimeoutEventPublisher).publish(any());
         }
 
         @Test
@@ -321,6 +337,56 @@ class OrderServiceImplTest {
             assertThatThrownBy(() -> orderService.cancelOrder(ORDER_ID))
                     .isInstanceOf(BusinessException.class)
                     .hasFieldOrPropertyWithValue("code", ResultCode.ORDER_STATUS_ERROR.getCode());
+        }
+    }
+
+    // ==================== RabbitMQ：订单超时取消 ====================
+
+    @Nested
+    @DisplayName("autoCancelTimeoutOrderByNo RabbitMQ 超时取消")
+    class AutoCancelTimeoutOrder {
+
+        @Test
+        @DisplayName("待确认订单成功超时取消，并释放商品")
+        void shouldCancelPendingOrderByOrderNo() {
+            when(orderMapper.selectOne(any())).thenReturn(pendingOrder());
+            // 第一条更新是订单 PENDING→CANCELED；商品更新也必须成功。
+            when(orderMapper.update(isNull(), any())).thenReturn(1);
+            when(productMapper.update(isNull(), any())).thenReturn(1);
+
+            boolean cancelled = orderService.autoCancelTimeoutOrderByNo("ORD-10");
+
+            assertThat(cancelled).isTrue();
+            verify(orderMapper).selectOne(any());
+            verify(orderMapper).update(isNull(), any());
+            verify(productMapper).update(isNull(), any());
+            verify(productCacheService).evict(PRODUCT_ID);
+        }
+
+        @Test
+        @DisplayName("订单已被确认或取消时跳过，不重复释放商品")
+        void shouldSkipWhenOrderStatusChanged() {
+            when(orderMapper.selectOne(any())).thenReturn(pendingOrder());
+            // 条件 UPDATE 影响 0 行，说明数据库中的状态已不是 PENDING。
+            when(orderMapper.update(isNull(), any())).thenReturn(0);
+
+            boolean cancelled = orderService.autoCancelTimeoutOrderByNo("ORD-10");
+
+            assertThat(cancelled).isFalse();
+            verify(productMapper, never()).update(isNull(), any());
+            verify(productCacheService, never()).evict(anyLong());
+        }
+
+        @Test
+        @DisplayName("订单不存在时视为幂等完成，不进入重试")
+        void shouldSkipWhenOrderDoesNotExist() {
+            when(orderMapper.selectOne(any())).thenReturn(null);
+
+            boolean cancelled = orderService.autoCancelTimeoutOrderByNo("ORD-NOT-FOUND");
+
+            assertThat(cancelled).isFalse();
+            verify(orderMapper, never()).update(isNull(), any());
+            verify(productMapper, never()).update(isNull(), any());
         }
     }
 

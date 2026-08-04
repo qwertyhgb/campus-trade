@@ -9,7 +9,6 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.ming.campustrade.common.Result;
-import com.ming.campustrade.common.annotation.RequireRole;
 import com.ming.campustrade.service.OrderService;
 import com.ming.campustrade.service.ProductService;
 import com.ming.campustrade.service.UserService;
@@ -23,14 +22,15 @@ import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.validation.annotation.Validated;
 
 /**
  * 管理员后台控制器 —— 处理商品审核、订单管理、用户封禁等后台 HTTP 请求。
  *
  * <h2>权限说明</h2>
- * <p>类上标注 {@code @RequireRole(1)}，表示本控制器下<b>所有接口都需要管理员权限</b>
- * （role >= 1）。普通用户访问任意接口都会被 RoleInterceptor 拦截并返回 403。
+ * <p>类上标注 {@code @PreAuthorize("hasRole('ADMIN')")}，表示本控制器下<b>所有接口都需要管理员权限</b>。
+ * 普通用户访问会被 Spring Security 拦截并返回 403（由 SecurityAccessHandler 输出 JSON）。
  * 这样无需在每个方法上重复标注，统一管理后台接口的权限。</p>
  *
  * <h2>接口一览</h2>
@@ -48,7 +48,7 @@ import org.springframework.validation.annotation.Validated;
 @Tag(name = "管理员后台", description = "商品审核、订单管理、用户封禁等后台管理操作（仅管理员）")
 @RestController
 @RequestMapping("/admin")
-@RequireRole(1) // 整个控制器都需要管理员权限
+@PreAuthorize("hasRole('ADMIN')") // 整个控制器都需要管理员权限（由 Spring Security 方法级安全管控）
 @Validated // 启用方法参数（@RequestParam/@PathVariable）上的约束校验（如 @Min/@Max）
 public class AdminController {
 

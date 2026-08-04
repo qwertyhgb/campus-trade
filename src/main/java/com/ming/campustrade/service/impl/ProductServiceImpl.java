@@ -141,7 +141,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
      * <p><b>流程：</b>从 ThreadLocal 获取当前登录用户 ID → 构建 Product 实体 → 保存到数据库</p>
      *
      * <p><b>为什么用 UserHolder.getUserVO().getId() 而不是从参数传 userId？</b><br>
-     * 因为 userId 来自登录拦截器验证通过的 token，是可信的。
+     * 因为 userId 来自 TokenAuthenticationFilter 验证通过的 token，是可信的。
      * 如果从请求参数传 userId，用户可以伪造（改一下请求体里的 userId 就能冒充别人发商品）。
      * 从 ThreadLocal 取则保证了 userId 一定是当前登录用户自己。</p>
      *
@@ -529,7 +529,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
      * 管理员查看商品详情（任意状态，含审核备注，不校验归属）
      *
      * <p>管理员需要查看平台任何商品（包括待审核/已驳回/下架）以进行审核和处理，
-     * 所以不限制状态也不校验归属。权限由 Controller 层的 @RequireRole(1) 保证。</p>
+     * 所以不限制状态也不校验归属。权限由 Controller 层的 @PreAuthorize("hasRole('ADMIN')") 保证。</p>
      *
      * @param id 商品 ID
      * @return 商品详情

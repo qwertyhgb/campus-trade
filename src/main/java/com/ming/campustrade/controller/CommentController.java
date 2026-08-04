@@ -11,7 +11,6 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.ming.campustrade.common.Result;
-import com.ming.campustrade.common.annotation.PublicApi;
 import com.ming.campustrade.dto.CommentAddDTO;
 import com.ming.campustrade.service.CommentService;
 import com.ming.campustrade.vo.CommentVO;
@@ -40,8 +39,8 @@ import org.springframework.validation.annotation.Validated;
  *
  * <h2>权限约定</h2>
  * <ul>
- *   <li>{@code @PublicApi}：公开接口，无需登录即可访问（如浏览商品留言、查看回复）</li>
- *   <li>无注解：需要登录（由 LoginInterceptor 拦截），如发表、删除留言</li>
+ *   <li>浏览商品留言和查看回复由 {@code SecurityConfig} 配置为公开接口</li>
+ *   <li>其他接口默认需要登录，如发表、删除留言</li>
  * </ul>
  *
  * @author ming
@@ -103,7 +102,7 @@ public class CommentController {
     /**
      * 查询商品下的顶级留言列表（公开接口，无需登录）。
      *
-     * <p>{@code @PublicApi} 标记此接口跳过登录拦截器，
+     * <p>SecurityConfig 将此接口配置为公开接口，
      * 因为未登录用户也应该能浏览商品留言（电商基本体验）。</p>
      *
      * <p>只返回顶级留言（parentId 为 null），回复列表由 /{id}/replies 单独加载。</p>
@@ -114,7 +113,6 @@ public class CommentController {
      * @return 分页的顶级留言列表
      */
     @Operation(summary = "商品留言列表", description = "分页查询商品下的顶级留言列表（公开接口），按时间正序")
-    @PublicApi
     @GetMapping("/product/{productId}")
     public Result<IPage<CommentVO>> listByProduct(@Parameter(description = "商品ID") @PathVariable Long productId,
                                                   @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
@@ -134,7 +132,6 @@ public class CommentController {
      * @return 分页的回复列表
      */
     @Operation(summary = "留言回复列表", description = "分页查询某条留言下的所有回复（公开接口），按时间正序")
-    @PublicApi
     @GetMapping("/{parentId}/replies")
     public Result<IPage<CommentVO>> listReplies(@Parameter(description = "父留言ID") @PathVariable Long parentId,
                                                 @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,

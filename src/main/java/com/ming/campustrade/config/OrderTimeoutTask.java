@@ -15,36 +15,38 @@ import com.ming.campustrade.service.OrderService;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * 订单超时自动取消定时任务
+ * 订单超时自动取消兜底定时任务
  *
  * <p><b>业务背景：</b><br>
  * 买家下单后，商品会被锁定（status=LOCKED），其他用户无法购买。
  * 如果买家下单后长时间不确认/付款，商品会一直被锁着，卖家无法卖给其他人。
- * 为了释放这些"占着茅坑不拉屎"的商品，需要一个定时任务：
- * 每隔一段时间扫描超时未确认的订单，自动取消并释放商品。</p>
+ * 为了释放这些"占着茅坑不拉屎"的商品，主要依靠 RabbitMQ 延迟消息在准确时间触发取消。
+ * 本定时任务保留为<b>兜底机制</b>：如果 RabbitMQ 暂时不可用、消息发送失败或消息进入死信队列，
+ * 定时扫描仍能最终释放商品，避免订单永久占用库存。</p>
  *
  * <p><b>执行频率：</b>每 60 秒执行一次（fixedRate = 60000 毫秒）</p>
  *
  * <p><b>超时阈值：</b>30 分钟（TIMEOUT_MINUTES = 30）
  * 即下单后 30 分钟内未确认的订单会被自动取消。</p>
  *
- * <p><b>为什么用定时任务而不是延迟队列？</b><br>
- * 延迟队列（如 RabbitMQ 死信队列、Redis ZSet）精度更高、实时性更好，
- * 但引入了额外的中间件依赖，运维复杂度上升。校园平台订单量小，
- * 对超时精度要求不高（差个几十秒无所谓），用 Spring 自带的 @Scheduled
- * 定时轮询最简单，无需额外依赖，完全够用。</p>
+ * <p><b>为什么仍然保留定时任务？</b><br>
+ * RabbitMQ 延迟消息负责“准时触发”，定时任务负责“最终兜底”。
+ * 两条路径最终都调用同一个条件更新方法：只有 PENDING 订单才能取消，
+ * 所以两者同时到达也不会重复释放商品。</p>
  *
  * @author ming
  */
 @Component
 @Slf4j
+@SuppressWarnings("null") // 抑制 MyBatis-Plus Lambda 方法引用（Order::getStatus 等）与 Eclipse 空类型分析冲突的误报警告
 public class OrderTimeoutTask {
 
     /**
      * 订单超时阈值（单位：分钟）。
      * 下单后超过这个时间仍未确认，订单将被自动取消。
      */
-    private final static int TIMEOUT_MINUTES = 30;
+    private static final int TIMEOUT_MINUTES =
+            (int) (RabbitMQConfig.ORDER_TIMEOUT_DELAY_MILLIS / 60_000L);
 
     private final OrderMapper orderMapper;
     private final OrderService orderService;

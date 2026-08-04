@@ -21,14 +21,18 @@ import com.ming.campustrade.dto.OrderPlaceDTO;
 import com.ming.campustrade.entity.Order;
 import com.ming.campustrade.entity.Product;
 import com.ming.campustrade.entity.User;
+import com.ming.campustrade.event.OrderTimeoutEvent;
 import com.ming.campustrade.mapper.OrderMapper;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
+import com.ming.campustrade.messaging.OrderTimeoutEventPublisher;
 import com.ming.campustrade.service.OrderService;
 import com.ming.campustrade.service.ProductCacheService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.OrderVO;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Slf4j
 @Service // 告诉 Spring 容器，这是一个业务逻辑层（Service）的组件，Spring 会自动扫描并创建它的实例（Bean）
@@ -41,15 +45,21 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     private final UserMapper userMapper;
     // 商品详情缓存组件：订单流程会改变商品状态（锁定/售出/释放），需同步清除商品缓存
     private final ProductCacheService productCacheService;
+    // 订单超时消息发布器：下单事务提交后，把超时检查消息送入 RabbitMQ TTL 队列
+    private final OrderTimeoutEventPublisher orderTimeoutEventPublisher;
 
     /**
      * 构造函数注入（Spring 推荐的依赖注入方式）：
      * Spring 在实例化 OrderServiceImpl 时，会自动查找容器中的这些实例并注入进来
      */
-    public OrderServiceImpl(ProductMapper productMapper, UserMapper userMapper, ProductCacheService productCacheService) {
+    public OrderServiceImpl(ProductMapper productMapper,
+                            UserMapper userMapper,
+                            ProductCacheService productCacheService,
+                            OrderTimeoutEventPublisher orderTimeoutEventPublisher) {
         this.productMapper = productMapper;
         this.userMapper = userMapper;
         this.productCacheService = productCacheService;
+        this.orderTimeoutEventPublisher = orderTimeoutEventPublisher;
     }
 
     /**
@@ -68,7 +78,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     @Override
     @Transactional // 声明式事务：该方法内所有的数据库操作必须在同一个事务中运行，若其中任何一步报错，所有操作都会回滚，保证数据一致性
     public void placeOrder(OrderPlaceDTO orderPlaceDTO) {
-        // 1. 从线程局部变量 ThreadLocal 中获取当前登录用户（买家）的 ID（已由拦截器提前注入）
+        // 1. 从线程局部变量 ThreadLocal 中获取当前登录用户（买家）的 ID（已由过滤器提前注入）
         Long buyerId = UserHolder.getUserVO().getId();
         log.info("下单：productId={}, buyerId={}", orderPlaceDTO.getProductId(), buyerId);
 
@@ -126,6 +136,20 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         this.save(order);
         // 商品已被锁定（ON_SALE→LOCKED），清除详情缓存避免其他用户看到过期的“在售”状态
         productCacheService.evict(order.getProductId());
+
+        // 事务提交后再发送超时消息：如果下单事务回滚，RabbitMQ 中不应该留下一个
+        // 指向不存在订单的延迟消息。即使发送失败，现有 OrderTimeoutTask 仍可作为兜底扫描。
+        OrderTimeoutEvent timeoutEvent = OrderTimeoutEvent.create(order.getId(), order.getOrderNo());
+        publishAfterCommit(() -> {
+            try {
+                orderTimeoutEventPublisher.publish(timeoutEvent);
+            } catch (Exception e) {
+                // 消息发送失败不回滚已经成功的下单事务；定时任务会继续负责兜底取消。
+                log.error("订单超时消息发送失败（定时任务将兜底）：orderId={}, orderNo={}",
+                        order.getId(), order.getOrderNo(), e);
+            }
+        });
+
         log.info("下单成功：orderId={}, orderNo={}, productId={}", order.getId(), order.getOrderNo(), order.getProductId());
     }
 
@@ -483,13 +507,65 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean autoCancelTimeoutOrder(Order order) {
+        return cancelPendingOrder(order, false);
+    }
+
+    /**
+     * RabbitMQ 消费者根据订单号处理超时事件。
+     *
+     * <p><b>为什么不能直接使用消息里的旧订单对象？</b><br>
+     * 消息在队列中等待 30 分钟期间，订单可能已经被卖家确认、用户取消，
+     * 所以消费者必须重新查询数据库，并且最终依靠 WHERE status = PENDING 的条件更新。
+     * 这保证“支付/确认”和“超时取消”并发到达时，只有一个操作能成功改变状态。</p>
+     */
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public boolean autoCancelTimeoutOrderByNo(String orderNo) {
+        if (orderNo == null || orderNo.isBlank()) {
+            return false;
+        }
+
+        // 直接使用 ServiceImpl 已绑定的 baseMapper 查询，避免为了单条查询创建额外的链式对象；
+        // 这里的条件等价于：SELECT * FROM `order` WHERE order_no = ? AND deleted = 0。
+        Order order = this.baseMapper.selectOne(new LambdaQueryWrapper<Order>()
+                .eq(Order::getOrderNo, orderNo));
+        if (order == null) {
+            // 订单可能因为下单事务回滚而不存在；这类消息无需重试，直接视为已处理。
+            log.warn("超时消息对应的订单不存在，跳过：orderNo={}", orderNo);
+            return false;
+        }
+        return cancelPendingOrder(order, true);
+    }
+
+    /**
+     * 订单超时取消的共享核心逻辑。
+     *
+     * <p>调用者已经处于独立事务中。订单状态和商品状态必须一起修改，
+     * 任一步失败都会抛异常让本笔事务回滚，避免订单取消但商品仍被锁定。</p>
+     */
+    private boolean cancelPendingOrder(Order order, boolean useOrderNoCondition) {
         // 1. 条件更新订单：PENDING → CANCELED
-        //    只有订单仍为“待确认”时才取消；若卖家已在超时前确认（status 变了），影响行数=0
-        boolean orderUpdated = this.lambdaUpdate()
-                .eq(Order::getId, order.getId())
-                .eq(Order::getStatus, OrderStatus.PENDING)
-                .set(Order::getStatus, OrderStatus.CANCELED)
-                .update();
+        //    PENDING 就是当前项目中“待确认/待付款”状态，对应题目里的 UNPAID。
+        //    只有订单仍为 PENDING 时才取消；若卖家已确认或用户已取消，影响行数=0。
+        // RabbitMQ 消息携带的是 orderNo，按订单号做条件更新，等价于：
+        // UPDATE `order` SET status = 2 WHERE order_no = ? AND status = 0;
+        // 兜底定时任务则按已经查出的主键更新。这里显式分成两个分支，
+        // 避免把“可选条件”拼成 OR 条件，导致更新范围扩大或 SQL 语义不清晰。
+        boolean orderUpdated;
+        if (useOrderNoCondition) {
+            orderUpdated = this.lambdaUpdate()
+                    .eq(Order::getOrderNo, order.getOrderNo())
+                    .eq(Order::getStatus, OrderStatus.PENDING)
+                    .set(Order::getStatus, OrderStatus.CANCELED)
+                    .update();
+        } else {
+            // 旧的定时兜底任务已经查出了实体，按主键更新可以少一次订单号解析。
+            orderUpdated = this.lambdaUpdate()
+                    .eq(Order::getId, order.getId())
+                    .eq(Order::getStatus, OrderStatus.PENDING)
+                    .set(Order::getStatus, OrderStatus.CANCELED)
+                    .update();
+        }
         if (!orderUpdated) {
             // 订单状态已变更（如已被确认），无需取消，返回 false 让调用方跳过
             log.info("超时取消跳过，订单状态已变更：orderId={}, orderNo={}", order.getId(), order.getOrderNo());
@@ -513,6 +589,26 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         log.info("超时订单已自动取消：orderId={}, orderNo={}, productId={}",
                 order.getId(), order.getOrderNo(), order.getProductId());
         return true;
+    }
+
+    /**
+     * 注册事务提交后的任务。
+     *
+     * <p>订单插入和商品锁定必须先提交，延迟消息才有意义；否则事务回滚后，
+     * RabbitMQ 仍可能保存一条无法找到订单的超时消息。</p>
+     */
+    private void publishAfterCommit(Runnable task) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    task.run();
+                }
+            });
+        } else {
+            // 防御性兜底：单元测试直接调用且没有事务时，立即执行发送逻辑。
+            task.run();
+        }
     }
     
     /**

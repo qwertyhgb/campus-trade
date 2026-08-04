@@ -1,8 +1,6 @@
 package com.ming.campustrade.controller;
 
 import com.ming.campustrade.common.Result;
-import com.ming.campustrade.common.annotation.PublicApi;
-import com.ming.campustrade.common.annotation.RequireRole;
 import com.ming.campustrade.dto.UserAddDTO;
 import com.ming.campustrade.dto.UserLoginDTO;
 import com.ming.campustrade.dto.UserPasswordUpdateDTO;
@@ -20,6 +18,7 @@ import jakarta.validation.Valid;
 
 import lombok.extern.slf4j.Slf4j;
 
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -53,9 +52,9 @@ import java.util.List;
  *
  * <h2>权限约定</h2>
  * <ul>
- *   <li>{@code @PublicApi}：公开接口，无需登录即可访问</li>
- *   <li>{@code @RequireRole(1)}：仅管理员（role >= 1）可访问</li>
- *   <li>无注解：需要登录（由 LoginInterceptor 拦截），但不限制角色</li>
+ *   <li>公开接口由 {@code SecurityConfig} 的 {@code permitAll()} 规则统一配置</li>
+ *   <li>{@code @PreAuthorize("hasRole('ADMIN')")}：仅管理员可访问（Spring Security 方法级安全）</li>
+ *   <li>无注解：需要登录（由 Security 的 authenticated() 拦截），但不限制角色</li>
  * </ul>
  *
  * @author Ming
@@ -80,7 +79,7 @@ public class UserController {
     /**
      * 用户注册（公开接口，无需登录）。
      *
-     * <p>{@code @PublicApi} 标记此接口跳过登录拦截器，因为注册时用户还没有账号。</p>
+     * <p>公开规则由 {@code SecurityConfig} 配置，因为注册时用户还没有账号。</p>
      * <p>{@code @Valid} 触发 Jakarta Validation 校验：DTO 上的 @NotBlank、@Size 等注解
      * 会在此处自动生效，校验不通过会直接返回 400 错误，不会进入方法体。</p>
      * <p>{@code @RequestBody} 表示从请求体中读取 JSON 并反序列化为 Java 对象。</p>
@@ -89,7 +88,6 @@ public class UserController {
      * @return 统一响应结果（无数据体）
      */
     @Operation(summary = "用户注册", description = "新用户注册账号（公开接口）")
-    @PublicApi
     @PostMapping("/register")
     public Result<Void> register(@RequestBody @Valid UserRegisterDTO userRegisterDTO) {
         log.info("用户注册：username={}", userRegisterDTO.getUsername());
@@ -108,7 +106,6 @@ public class UserController {
      * @return 包含 token 和用户信息的 LoginVO
      */
     @Operation(summary = "用户登录", description = "用户登录，返回 token 和用户基本信息（公开接口）")
-    @PublicApi
     @PostMapping("/login")
     public Result<LoginVO> login(@RequestBody @Valid UserLoginDTO userLoginDTO) {
         log.info("用户登录：username={}", userLoginDTO.getUsername());
@@ -138,13 +135,13 @@ public class UserController {
     /**
      * 获取所有用户列表（仅管理员）。
      *
-     * <p>{@code @RequireRole(1)} 表示需要管理员权限（role >= 1），
-     * 普通用户访问会被 RoleInterceptor 拦截并返回 403。</p>
+     * <p>{@code @PreAuthorize("hasRole('ADMIN')")} 表示需要 ADMIN 角色，
+     * 普通用户访问会被 Spring Security 拦截并返回 403。</p>
      *
      * @return 所有用户的列表
      */
     @Operation(summary = "用户列表", description = "获取所有用户列表（仅管理员）")
-    @RequireRole(1)
+    @PreAuthorize("hasRole('ADMIN')")
     @GetMapping("/list")
     public Result<List<UserVO>> list() {
         log.info("管理员查询用户列表");
@@ -162,7 +159,7 @@ public class UserController {
      * @return 统一响应结果（无数据体）
      */
     @Operation(summary = "新增用户", description = "管理员新增用户（仅管理员）")
-    @RequireRole(1)
+    @PreAuthorize("hasRole('ADMIN')")
     @PostMapping("/add")
     public Result<Void> add(@RequestBody @Valid UserAddDTO userAddDTO) {
         log.info("管理员新增用户：username={}", userAddDTO.getUsername());
@@ -191,7 +188,7 @@ public class UserController {
      * 获取当前登录用户信息（需要登录）。
      *
      * <p>从 ThreadLocal（UserHolder）中取出当前用户，
-     * 这个值是 LoginInterceptor 在拦截阶段根据 token 查出来并存入的。</p>
+     * 这个值是 TokenAuthenticationFilter 根据 token 查出来并存入的。</p>
      *
      * @return 当前登录用户的信息
      */

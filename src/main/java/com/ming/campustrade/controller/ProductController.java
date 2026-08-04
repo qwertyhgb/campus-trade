@@ -12,7 +12,6 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.ming.campustrade.common.Result;
-import com.ming.campustrade.common.annotation.PublicApi;
 import com.ming.campustrade.dto.ProductPublishDTO;
 import com.ming.campustrade.dto.ProductQueryDTO;
 import com.ming.campustrade.dto.ProductUpdateDTO;
@@ -58,8 +57,8 @@ import org.springframework.validation.annotation.Validated;
  *
  * <h2>权限约定</h2>
  * <ul>
- *   <li>{@code @PublicApi}：公开接口，无需登录即可访问（如浏览商品列表、查看详情）</li>
- *   <li>无注解：需要登录（由 LoginInterceptor 拦截），但不限制角色（如发布、编辑商品）</li>
+ *   <li>商品列表和详情等公开接口由 {@code SecurityConfig} 的 {@code permitAll()} 规则配置</li>
+ *   <li>其他接口默认需要登录，但不限制角色（如发布、编辑商品）</li>
  * </ul>
  *
  * @author Ming
@@ -145,14 +144,13 @@ public class ProductController {
     /**
      * 查询商品详情（公开接口，无需登录）。
      *
-     * <p>{@code @PublicApi} 标记此接口跳过登录拦截器，
+     * <p>SecurityConfig 将商品详情配置为公开接口，
      * 因为未登录用户也应该能浏览商品详情（电商基本体验）。</p>
      *
      * @param id 商品ID（路径变量）
      * @return 商品详细信息（含卖家信息、分类名称等）
      */
     @Operation(summary = "查询商品详情", description = "根据商品ID获取商品详细信息（公开接口，仅返回在售商品）")
-    @PublicApi
     @GetMapping("/{id}")
     public Result<ProductVO> getById(@Parameter(description = "商品ID") @PathVariable Long id) {
         log.info("查询商品详情：productId={}", id);
@@ -187,7 +185,6 @@ public class ProductController {
      * @return 分页的商品列表（IPage 包含 records、total、pages 等分页信息）
      */
     @Operation(summary = "商品列表查询", description = "根据条件分页查询在售商品列表（公开接口），支持按分类、关键词等筛选")
-    @PublicApi
     @GetMapping("/list")
     public Result<IPage<ProductVO>> list(@Valid ProductQueryDTO productQueryDTO) {
         log.info("商品列表查询：keyword={}, categoryId={}, pageNo={}, pageSize={}",

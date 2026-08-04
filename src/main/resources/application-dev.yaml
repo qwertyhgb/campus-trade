@@ -6,14 +6,46 @@ spring:
     driver-class-name: com.mysql.cj.jdbc.Driver
     url: jdbc:mysql://localhost:3306/campus_trade?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
     username: ${DB_USERNAME:root}
-    password: ${DB_PASSWORD}
+    # 本地 Docker MySQL 的默认密码。部署到其他环境时请通过 DB_PASSWORD 覆盖，
+    # 不要把生产环境密码写进配置文件或提交到代码仓库。
+    password: ${DB_PASSWORD:2168884970}
 
   data:
     redis:
       host: localhost
       port: 6379
       database: 0
-  
+
+  # RabbitMQ 消息队列配置
+  #
+  # 当前项目在 Windows 宿主机上运行，RabbitMQ 通过 Docker 映射到 localhost:5672，
+  # 所以这里填写 localhost。以后如果 Spring Boot 也放进 Docker，host 要改成
+  # RabbitMQ 容器名 dianping-rabbitmq，而不是 localhost。
+  rabbitmq:
+    host: localhost                 # AMQP 客户端连接端口，不是管理后台端口
+    port: 5672
+    username: ${RABBITMQ_USERNAME:campus_admin}
+    # 开发环境默认值与 Docker 启动容器时保持一致；部署到其他环境时请通过
+    # RABBITMQ_PASSWORD 环境变量覆盖，不要把生产密码提交到代码仓库。
+    password: ${RABBITMQ_PASSWORD:ChangeMe_Rabbit_2026!}
+    virtual-host: campus_trade     # RabbitMQ 中独立的逻辑命名空间
+
+    # 发布确认：RabbitTemplate 发送消息后，可以知道 RabbitMQ 是否成功接收。
+    # 后续发送通知、候补补位消息时，可以据此记录发送失败并进行重试。
+    publisher-confirm-type: correlated
+
+    # 发布返回：消息已经到达交换机，但没有匹配到任何队列时通知应用。
+    # 这能帮助我们发现 routingKey 或绑定配置写错的问题。
+    publisher-returns: true
+
+    listener:
+      simple:
+        # 手动确认消息：业务处理成功后再 ack，处理失败可以拒绝并重新入队，
+        # 避免消费者刚收到消息就宕机导致消息直接丢失。
+        acknowledge-mode: manual
+        # 一次最多给同一个消费者预取 10 条未确认消息，避免单个消费者积压过多任务。
+        prefetch: 10
+
   servlet:
     multipart:
       max-file-size: 5MB        # 单个文件最大 5MB（图片一般不超过这个大小）

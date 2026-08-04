@@ -53,7 +53,7 @@ public final class RedisConstants {
      *
      * 滑动过期机制（Sliding Expiration）：
      * 并不是登录后固定 30 分钟就过期，而是每次用户发起请求时，
-     * 拦截器会重新刷新这个 Key 的过期时间（重置为 30 分钟）。
+     * 过滤器会重新刷新这个 Key 的过期时间（重置为 30 分钟）。
      * 效果：只要用户持续操作，登录状态就不会过期；一旦停止操作超过 30 分钟，才会过期。
      * 这比固定过期时间更友好，避免了"用户正在操作却突然被踢出登录"的体验问题。
      *
@@ -90,7 +90,7 @@ public final class RedisConstants {
      * <p><b>为什么需要这个标记？</b><br>
      * token Hash 里的 status 是登录时的快照，封禁后可能仍是旧值 1（尤其是
      * token 集合先过期、强制下线未生效的情况）。仅靠 Hash 里的 status 判断不可靠。
-     * 封禁时实时写入 login:disabled:{userId} 标记，拦截器优先检查它，
+     * 封禁时实时写入 login:disabled:{userId} 标记，过滤器优先检查它，
      * 能立即拦住被封禁的用户；解封时删除该标记。</p>
      */
     public static final String LOGIN_DISABLED_KEY = "login:disabled:";

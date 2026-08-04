@@ -5,7 +5,7 @@ import com.ming.campustrade.vo.UserVO;
 /**
  * 用户上下文（基于 ThreadLocal）
  *
- * <p>使用场景：在登录拦截器中把当前登录用户信息存入当前线程，
+ * <p>使用场景：在 TokenAuthenticationFilter（认证过滤器）中把当前登录用户信息存入当前线程，
  * 业务方法中可通过 {@link #getUserVO()} 直接获取当前登录用户，
  * 避免在 Controller / Service 方法签名中层层传递 userId 或 user 对象。</p>
  *
@@ -14,13 +14,13 @@ import com.ming.campustrade.vo.UserVO;
  * ThreadLocal 可以在同一线程内任意位置存取数据，天然线程隔离。</p>
  *
  * <p><b>使用规范：</b><br>
- * ① 在拦截器中调用 {@link #saveUser(UserVO)} 存放用户<br>
+ * ① 在过滤器（TokenAuthenticationFilter）中调用 {@link #saveUser(UserVO)} 存放用户<br>
  * ② 在 finally 块中调用 {@link #removeUser()} 清理（必须！防止线程复用导致内存泄漏）<br>
  * ③ 在 Controller / Service 中调用 {@link #getUserVO()} 获取当前登录用户</p>
  *
  * <p><b>典型调用链：</b></p>
  * <pre>{@code
- * // 1. 拦截器中
+ * // 1. 过滤器（TokenAuthenticationFilter）中
  * UserHolder.saveUser(currentUser);
  * try {
  *     // 放行业务
@@ -48,7 +48,7 @@ public class UserHolder {
     /**
      * 保存当前登录用户到当前线程
      *
-     * <p>通常在登录拦截器 preHandle 中调用，业务方法中无需关心</p>
+     * <p>通常在 TokenAuthenticationFilter 中调用，业务方法中无需关心</p>
      *
      * @param userVO 当前登录用户信息（从 Redis / Session 中解析得到）
      */
@@ -60,7 +60,7 @@ public class UserHolder {
      * 获取当前线程中保存的登录用户
      *
      * <p>通常在 Controller / Service 中调用，调用前无需判空<br>
-     * 若返回 null 说明：① 未登录被拦截 ② 拦截器未配置 ③ 拦截器未调用 saveUser</p>
+     * 若返回 null 说明：① 未登录被拦截 ② 过滤器未配置 ③ 过滤器未调用 saveUser</p>
      *
      * @return 当前登录用户，未登录返回 null
      */

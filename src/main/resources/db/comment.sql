@@ -33,60 +33,39 @@ USE campus_trade;
 --    三列联合完美覆盖 WHERE + ORDER BY，一次索引扫描即可拿到有序结果。
 -- ========================================================================
 
-CREATE TABLE comment (
+CREATE TABLE IF NOT EXISTS comment (
     id               BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT COMMENT '留言ID',
     product_id       BIGINT UNSIGNED NOT NULL COMMENT '商品ID',
     user_id          BIGINT UNSIGNED NOT NULL COMMENT '留言用户ID',
     content          VARCHAR(500) NOT NULL COMMENT '留言内容',
     parent_id        BIGINT UNSIGNED DEFAULT NULL COMMENT '父留言ID（NULL=顶级留言，非NULL=回复某条留言）',
     reply_to_user_id BIGINT UNSIGNED DEFAULT NULL COMMENT '被回复的用户ID（回复时记录，用于展示"回复 @xxx"）',
-    create_time      DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '留言时间',
-    update_time      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    create_time      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '留言时间',
+    update_time      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     deleted          TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '逻辑删除：0未删除 1已删除',
 
-    -- 单列索引：查"我的留言"列表
+    -- 单列索引：查“我的留言”列表
     INDEX idx_user_id (user_id),
-    -- 单列索引：查"某条留言的所有回复"
-    INDEX idx_parent_id (parent_id)
+    -- 单列索引：查“某条留言的所有回复”
+    INDEX idx_parent_id (parent_id),
+
+    -- 联合索引 1：商品详情页留言列表（最高频查询）
+    -- SQL：SELECT * FROM comment WHERE product_id=? AND deleted=0 ORDER BY create_time DESC
+    -- 查询频率：极高（每个用户打开商品详情页都会触发）
+    -- 最左前缀：
+    --   ✅ WHERE product_id=? AND deleted=0 ORDER BY create_time → 完全命中
+    --   ✅ WHERE product_id=? AND deleted=0                      → 命中（前两列）
+    --   ✅ WHERE product_id=?                                    → 命中（最左列）
+    --   ❌ WHERE deleted=0 ORDER BY create_time                  → 未从 product_id 开始
+    INDEX idx_productid_deleted_createtime (product_id, deleted, create_time),
+
+    -- 联合索引 2：查看某条留言的回复列表
+    -- SQL：SELECT * FROM comment WHERE parent_id=? AND deleted=0 ORDER BY create_time ASC
+    -- 查询频率：中等（用户展开某条留言的回复时触发）
+    -- 最左前缀：
+    --   ✅ WHERE parent_id=? AND deleted=0 ORDER BY create_time → 完全命中
+    --   ✅ WHERE parent_id=? AND deleted=0                      → 命中（前两列）
+    --   ✅ WHERE parent_id=?                                    → 命中（最左列）
+    --   ❌ WHERE deleted=0 ORDER BY create_time                 → 未从 parent_id 开始
+    INDEX idx_parentid_deleted_createtime (parent_id, deleted, create_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='商品留言表';
-
--- ========================================================================
--- 联合索引 1：商品详情页留言列表（最高频查询）
--- ========================================================================
--- SQL 原型：SELECT * FROM comment WHERE product_id=? AND deleted=0 ORDER BY create_time DESC
--- 查询频率：极高（每个用户打开商品详情页都会触发）
---
--- 为什么是 (product_id, deleted, create_time) 而不是 (product_id, create_time)？
---   MyBatis-Plus 配置了逻辑删除（@TableLogic），所有查询自动追加 AND deleted=0。
---   实际执行的 SQL 一定包含 deleted=0 这个等值条件。如果索引中没有 deleted 列，
---   MySQL 通过 product_id 定位后，还需要逐行判断 deleted 是否为 0（回表过滤），
---   当已删除的留言较多时浪费 IO。把 deleted 加入索引后，三列联合可以：
---     product_id=? → 定位商品
---     deleted=0   → 在索引内直接过滤已删除记录
---     create_time → 利用索引有序性完成排序，无需 filesort
---
--- 最左前缀实践：
---   ✅ WHERE product_id=? AND deleted=0 ORDER BY create_time → 完全命中
---   ✅ WHERE product_id=? AND deleted=0                      → 命中（前两列）
---   ✅ WHERE product_id=?                                    → 命中（最左列）
---   ❌ WHERE deleted=0 ORDER BY create_time                  → 未从 product_id 开始，无法使用
--- ========================================================================
-ALTER TABLE comment ADD INDEX idx_productid_deleted_createtime (product_id, deleted, create_time);
-
--- ========================================================================
--- 联合索引 2：查看某条留言的回复列表
--- ========================================================================
--- SQL 原型：SELECT * FROM comment WHERE parent_id=? AND deleted=0 ORDER BY create_time ASC
--- 查询频率：中等（用户展开某条留言的回复时触发）
---
--- 设计思路与索引 1 对称：
---   parent_id 等值过滤 → deleted 等值过滤 → create_time 排序
---   回复通常按时间正序展示（先发的在前），所以用 ASC。
---
--- 为什么不用单列 idx_parent_id？
---   单列索引能定位到 parent_id=? 的记录，但 deleted=0 需要回表过滤，
---   ORDER BY create_time 需要 filesort。联合索引一次搞定，性能更优。
---   但单列 idx_parent_id 仍保留，用于不需要排序的简单存在性判断
---   （如"这条留言是否有回复"）。
--- ========================================================================
-ALTER TABLE comment ADD INDEX idx_parentid_deleted_createtime (parent_id, deleted, create_time);

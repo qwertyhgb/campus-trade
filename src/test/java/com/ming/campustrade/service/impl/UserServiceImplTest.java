@@ -10,6 +10,7 @@ import com.ming.campustrade.dto.UserRegisterDTO;
 import com.ming.campustrade.entity.User;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
+import com.ming.campustrade.mapper.UserRoleMapper;
 import com.ming.campustrade.service.ProductCacheService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.LoginVO;
@@ -60,6 +61,9 @@ class UserServiceImplTest {
     @Mock
     private ProductCacheService productCacheService;
 
+    @Mock
+    private UserRoleMapper userRoleMapper;
+
     private UserServiceImpl userService;
 
     @Captor
@@ -87,7 +91,8 @@ class UserServiceImplTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        userService = new UserServiceImpl(stringRedisTemplate, passwordEncoder, productMapper, productCacheService);
+        userService = new UserServiceImpl(stringRedisTemplate, passwordEncoder, productMapper,
+                productCacheService, userRoleMapper);
         Field field = CrudRepository.class.getDeclaredField("baseMapper");
         field.setAccessible(true);
         field.set(userService, userMapper);

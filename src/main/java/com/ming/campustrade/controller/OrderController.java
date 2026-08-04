@@ -54,7 +54,7 @@ import org.springframework.validation.annotation.Validated;
  *
  * <h2>权限约定</h2>
  * <p>
- * 本控制器所有接口都「需要登录」（没有 @PublicApi 标记），
+ * 本控制器所有接口都需要登录，
  * 因为订单涉及买卖双方的私有数据，不允许未登录用户访问。
  * 具体的「只能看自己的订单」逻辑在 Service 层通过当前用户 ID 过滤实现。
  * </p>
