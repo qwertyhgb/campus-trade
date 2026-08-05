@@ -87,4 +87,15 @@ public interface OrderService extends IService<Order> {
      * @return true=已成功取消；false=订单状态已变更（如已被确认），跳过
      */
     boolean autoCancelTimeoutOrder(Order order);
+
+    /**
+     * 根据订单号处理 RabbitMQ 投递的超时检查事件。
+     *
+     * <p>消费者不能直接把消息里的订单对象当成最新数据，必须重新查库，
+     * 再用状态条件更新判断订单是否仍处于 PENDING。</p>
+     *
+     * @param orderNo 订单号
+     * @return true=本次成功取消；false=订单不存在或状态已经变化
+     */
+    boolean autoCancelTimeoutOrderByNo(String orderNo);
 }

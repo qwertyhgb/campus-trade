@@ -78,8 +78,8 @@ public class FavoriteServiceImpl extends ServiceImpl<FavoriteMapper, Favorite> i
      */
     @Override
     public void addFavorite(Long productId) {
-        // 1. 从线程局部变量 ThreadLocal 中获取当前登录用户的 ID（已由 LoginInterceptor 提前注入）。
-        //    使用 Objects.requireNonNull 做空值保护：如果拦截器未正确注入用户信息，
+        // 1. 从线程局部变量 ThreadLocal 中获取当前登录用户的 ID（已由 TokenAuthenticationFilter 提前注入）。
+        //    使用 Objects.requireNonNull 做空值保护：如果认证过滤器未正确注入用户信息，
         //    这里会立即抛出 NullPointerException 并附带明确的提示信息，方便排查问题。
         //    这比在类上贴 @SuppressWarnings("null") 压制警告更好——压制只是让编译器闭嘴，
         //    真正的空指针隐患依然存在。

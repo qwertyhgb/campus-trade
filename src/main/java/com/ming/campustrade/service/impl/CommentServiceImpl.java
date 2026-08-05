@@ -71,7 +71,7 @@ public class CommentServiceImpl extends ServiceImpl<CommentMapper, Comment> impl
     @Override
     public void addComment(CommentAddDTO commentAddDTO) {
         // ===== 第 1 步：获取当前登录用户 ID =====
-        // 从 ThreadLocal 中取出（由 LoginInterceptor 在请求进入时注入），
+        // 从 ThreadLocal 中取出（由 TokenAuthenticationFilter 在请求进入时注入），
         // 而不是从前端参数传入——防止用户伪造 userId 冒充他人发言。
         Long userId = UserHolder.getUserVO().getId();
 
@@ -169,7 +169,7 @@ public class CommentServiceImpl extends ServiceImpl<CommentMapper, Comment> impl
     public void deleteComment(Long id) {
         log.info("删除留言：commentId={}", id);
 
-        // 1. 从 ThreadLocal 获取当前登录用户 ID（由拦截器注入，不可伪造）
+        // 1. 从 ThreadLocal 获取当前登录用户 ID（由过滤器注入，不可伪造）
         Long userId = UserHolder.getUserVO().getId();
 
         // 2. 根据 ID 查询留言（MyBatis-Plus 自动加 WHERE deleted=0，已删除的查不到）
@@ -333,7 +333,7 @@ public class CommentServiceImpl extends ServiceImpl<CommentMapper, Comment> impl
      */
     @Override
     public IPage<CommentVO> getMyComments(Integer pageNo, Integer pageSize) {
-        // 从 ThreadLocal 获取当前登录用户 ID（由拦截器注入，不可伪造）
+        // 从 ThreadLocal 获取当前登录用户 ID（由过滤器注入，不可伪造）
         Long userId = UserHolder.getUserVO().getId();
         log.info("查询我的留言列表：userId={}, pageNo={}, pageSize={}", userId, pageNo, pageSize);
 

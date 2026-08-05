@@ -1,6 +1,8 @@
-# 校园二手交易平台 (Campus Trade)
+# 校园活动预约与候补通知平台 (Campus Trade)
 
-基于 Spring Boot 4.1 + Java 21 的校园二手交易平台后端，涵盖商品发布与审核、分类管理、订单交易（含超时自动取消）、商品留言、收藏、用户管理（封禁/资料修改）、管理员后台等完整业务。采用 Redis 存储登录态与商品缓存，自定义注解 + 拦截器实现轻量级 RBAC 权限控制，订单模块使用事务和条件更新保证数据一致性与并发安全。
+基于 Java 21 + Spring Boot 4.1 的校园活动预约与候补通知平台后端，在原有「校园二手交易平台」基础上演进而来，保留了商品交易、订单、收藏、留言等模块，并新增了活动创建/审核/预约/候补/通知的完整业务闭环。
+
+核心特色：**Spring Security 无状态 Token 认证 + 多角色 RBAC 权限模型**、**预约并发防超卖四道防线**、**候补队列自动补位**、**RabbitMQ 事件驱动异步通知（重试 + 死信 + 消费幂等）**、**Redis 滑动过期登录态与商品缓存**。
 
 ## 技术栈
 
@@ -8,10 +10,11 @@
 |------|------|------|
 | Java | 21 | 编程语言（最新 LTS） |
 | Spring Boot | 4.1.0 | Web 框架 |
+| Spring Security | — | Token 认证 + 方法级授权（@EnableMethodSecurity） |
 | MyBatis-Plus | 3.5.16 | ORM 框架（含分页插件） |
-| MySQL | 8.x | 主数据库 |
-| Redis | 7.x | 登录态存储 + 商品缓存 |
-| spring-security-crypto | — | BCrypt 密码加密 |
+| MySQL | 8.x | 主数据库（含 CHECK 约束、部分唯一索引技巧） |
+| Redis | 7.x | 登录态存储 + 商品详情缓存 |
+| RabbitMQ | — | 事件驱动异步通知 + 订单超时延迟队列 |
 | Knife4j | 4.5.0 | 接口文档（OpenAPI 3） |
 | Lombok | — | 减少样板代码 |
 | Jakarta Validation | — | 参数校验 |
@@ -20,188 +23,245 @@
 
 ## 核心功能
 
-- **用户模块**：注册、登录（Redis Token + 滑动过期）、登出、修改个人信息、修改密码、管理员新增用户
-- **权限控制**：自定义 @PublicApi / @RequireRole 注解 + 拦截器实现轻量级 RBAC
-- **商品模块**：发布（审核制）、编辑、删除、详情（Redis 缓存）、列表（分页/搜索/筛选/排序）、上下架
-- **商品审核**：发布后进入待审核状态，管理员审核通过才上架，驳回可附原因
-- **分类模块**：分类增删改查（管理员权限）
-- **订单模块**：下单、确认、取消，事务保证一致性，条件更新防并发，超时 30 分钟自动取消
-- **留言模块**：两级评论结构（顶级留言 + 平铺回复），发表/删除/按商品查询/回复列表/我的留言
-- **收藏模块**：收藏/取消收藏（唯一索引防重复，幂等操作）、收藏状态查询、我的收藏列表
+### 一、活动预约业务（新）
+
+- **活动模块**：创建/编辑/删除（组织者）、提交审核、管理员审核（通过/驳回附原因）、下架、公开列表（关键词/分类/状态/时间范围筛选）、公开详情、我的活动
+- **活动状态机**：草稿 → 待审核 → 报名中 → 报名结束 → 进行中 → 已结束，可被驳回或下架；所有状态变更走白名单校验 `canTransition()`
+- **预约模块**：预约、取消、我的预约（含历史）、组织者查看预约名单；并发防超卖（见下方亮点）
+- **候补队列**：满员后加入候补（悲观锁保证排队顺序）、取消候补、我的候补、实时排队位置查询
+- **自动补位**：已预约用户取消后，候补队首自动转为正式预约（事务提交后触发，防死锁）
+- **站内通知**：预约成功/取消、加入候补、候补补位、审核结果、活动即将开始，共 7 类通知 + 模拟邮件/短信渠道
+
+### 二、二手交易业务（原有）
+
+- **用户模块**：注册、登录（Redis Token + 滑动过期）、登出、修改资料、修改密码、管理员新增用户
+- **商品模块**：发布（审核制）、编辑、删除（逻辑删除）、详情（Redis 缓存）、列表（分页/搜索/筛选/排序）、上下架、我的商品
+- **商品审核**：发布后进入待审核，管理员审核通过才上架，驳回附原因
+- **订单模块**：下单、确认、取消、详情、我买的/我卖的；事务保证一致性 + 条件更新防并发超卖 + 商品快照
+- **订单超时**：下单 30 分钟未确认自动取消（RabbitMQ 延迟队列 + 定时任务双保险）
+- **分类模块**：增删改查（管理员权限）
+- **收藏模块**：收藏/取消（唯一索引防重复、幂等）、状态查询、我的收藏
+- **留言模块**：两级评论结构（顶级留言 + 平铺回复，强制两级防无限嵌套）
 - **管理员后台**：商品审核、全状态商品列表、全平台订单列表、用户封禁/解封
+
+### 三、平台能力
+
 - **图片上传**：本地磁盘存储，支持 jpg/png/gif/webp，UUID 命名防冲突
-- **Redis 缓存**：商品详情 Cache-Aside 缓存，防穿透（空值缓存）+ 防雪崩（随机 TTL）+ 读写降级保护
-- **定时任务**：@Scheduled 订单超时自动取消，条件更新防竞态，逐笔容错
+- **权限控制**：Spring Security URL 规则 + @PreAuthorize 方法级授权 + Service 层归属校验（双重防越权）
+- **消息队列**：6 类业务事件 + 订单超时事件，发布确认 + 手动 ack + 持久化 + TTL 重试 + 死信队列
+- **消费幂等**：message_consume_record 表 event_id 唯一索引，at-least-once 投递下不产生重复通知
+- **定时任务**：活动状态自动推进、活动开始前 30 分钟提醒、订单超时取消（均为 @Scheduled，每分钟）
 
 ## 项目架构
 
 ```
 campus-trade/
 ├── common/                  # 公共层
-│   ├── Result.java          # 统一响应包装（静态工厂模式）
-│   ├── ResultCode.java      # 错误码枚举（按模块分段：1000用户/2000商品/3000分类/4000订单/5000收藏/6000留言）
-│   ├── annotation/          # 自定义注解（@PublicApi、@RequireRole）
-│   ├── constant/            # 常量（RedisConstants、ProductStatus、OrderStatus）
-│   └── exception/           # 业务异常 + 全局异常处理器（@RestControllerAdvice）
+│   ├── Result.java          # 统一响应包装
+│   ├── ResultCode.java      # 错误码枚举（1000用户/2000商品/3000分类/4000订单/5000收藏/6000留言/7000审核/8000活动/9000预约/9100候补/9200通知）
+│   ├── constant/            # 状态常量（ActivityStatus/ReservationStatus/WaitlistStatus/OrderStatus/ProductStatus/RedisConstants）
+│   └── exception/           # 业务异常 + 全局异常处理器
 ├── config/                  # 配置层
-│   ├── LoginInterceptor     # 登录拦截器（Token 验证 + @PublicApi 放行 + 滑动过期）
-│   ├── RoleInterceptor      # 角色拦截器（@RequireRole 权限校验）
-│   ├── WebMvcConfig         # 拦截器注册 + 静态资源映射
-│   ├── MybatisPlusConfig    # 分页插件配置
-│   ├── SecurityConfig       # BCrypt 密码编码器
-│   ├── OpenApiConfig        # Knife4j 接口文档配置
-│   └── OrderTimeoutTask     # 订单超时自动取消定时任务（@Scheduled）
-├── controller/              # 控制层（7 个 Controller，40+ 接口）
-│   ├── UserController       # 用户注册/登录/登出/资料修改/密码修改
-│   ├── ProductController    # 商品发布/编辑/删除/详情/列表/上下架/我的商品
+│   ├── SecurityConfig       # Spring Security 过滤器链（URL 授权规则 + 401/403 JSON）
+│   ├── TokenAuthenticationFilter  # Token 认证过滤器（Redis 查用户 → SecurityContext）
+│   ├── SecurityAccessHandler      # 401/403 统一 JSON 响应
+│   ├── RabbitMQConfig       # 交换机/队列/绑定声明（通知 + 订单超时两套资源）
+│   ├── RabbitMessageConverterConfig  # Jackson JSON 消息转换器
+│   ├── MybatisPlusConfig    # 分页插件
+│   ├── OpenApiConfig        # Knife4j 文档
+│   ├── ActivityStatusTask   # 活动状态自动推进（每分钟）
+│   ├── ActivityUpcomingNotificationTask  # 活动开始前提醒（每分钟）
+│   └── OrderTimeoutTask     # 订单超时扫描兜底（每分钟，与延迟队列双保险）
+├── controller/              # 控制层（14 个 Controller，约 68 个接口）
+│   ├── UserController       # 注册/登录/登出/资料/密码/用户管理
+│   ├── ProductController    # 商品发布/编辑/删除/详情/列表/状态/我的商品
 │   ├── OrderController      # 下单/确认/取消/详情/我买的/我卖的
 │   ├── CategoryController   # 分类增删改查
-│   ├── FavoriteController   # 收藏/取消/状态查询/我的收藏
-│   ├── CommentController    # 留言发表/删除/商品留言列表/回复列表/我的留言
-│   └── AdminController      # 管理员后台（商品审核/订单管理/用户封禁）
-├── dto/                     # 请求参数对象（12 个 DTO）
-├── entity/                  # 数据库实体（6 个 Entity）
-├── mapper/                  # 数据访问层（6 个 Mapper）
-├── service/                 # 业务逻辑层（6 个接口 + 6 个实现）
-├── utils/                   # 工具类（UserHolder ThreadLocal）
-└── vo/                      # 响应视图对象（7 个 VO）
+│   ├── FavoriteController   # 收藏/取消/状态/我的收藏
+│   ├── CommentController    # 留言发表/删除/列表/回复/我的留言
+│   ├── AdminController      # 商品审核/商品与订单列表/封禁解封
+│   ├── UploadController     # 图片上传
+│   ├── ActivityController   # 活动创建/编辑/删除/审核/下架/列表/详情/我的活动
+│   ├── ActivityCategoryController  # 活动分类管理
+│   ├── ReservationController       # 预约/取消/我的预约/活动名单
+│   ├── WaitlistController          # 候补加入/取消/我的候补/排队位置
+│   └── NotificationController      # 我的通知/未读数/已读/全部已读
+├── event/                   # RabbitMQ 事件对象（7 个，含 BaseNotificationEvent 父类）
+├── messaging/               # 消息发布/消费（NotificationEventPublisher + 2 个消费者）
+├── dto/                     # 请求参数对象（18 个 DTO）
+├── entity/                  # 数据库实体（15 个 Entity）
+├── mapper/                  # 数据访问层（15 个 Mapper）
+├── service/                 # 业务逻辑层（接口 + 实现）
+├── utils/                   # UserHolder（ThreadLocal 用户上下文）
+└── vo/                      # 响应视图对象（14 个 VO）
 ```
+
+## 权限体系（Spring Security + RBAC）
+
+### 角色模型
+
+| 角色 | 说明 | 主要权限 |
+|------|------|---------|
+| USER | 普通用户 | 浏览/搜索/发布商品、购买、收藏、留言、预约活动、加入候补 |
+| ORGANIZER | 活动组织者 | 创建/编辑/删除/提交自己组织的活动、查看预约名单 |
+| AUDITOR | 活动审核员 | 审核待审核的活动 |
+| ADMIN | 系统管理员 | 活动下架、商品审核、用户封禁、分类管理、活动分类管理等全部权限 |
+
+采用标准的 `role` + `user_role`（多对多）RBAC 模型，替代旧的 `user.role` 单字段（`role_v2.sql` 提供数据迁移，多角色用户可同时拥有多个角色）。
+
+### 认证与授权流程
+
+```
+请求 → TokenAuthenticationFilter（认证）
+  → 取 Authorization: Bearer {token}
+  → 查 Redis Hash（login:user:{token}）→ 恢复用户信息
+  → 封禁即时拦截（login:disabled:{userId} 标记 + status 快照兜底）
+  → 刷新 TTL（滑动过期，30 分钟无操作自动过期）
+  → 维护"用户 → Token 集合"反向索引（封禁时强制下线）
+  → 角色编码 → ROLE_ 前缀权限列表 → 放入 SecurityContext
+  → 授权规则（URL 层）→ @PreAuthorize（方法层）→ Service 归属校验（数据层）
+```
+
+三层权限校验互不替代：URL 规则拦截路径、`@PreAuthorize` 控制角色、Service 层校验数据归属（如组织者只能看自己活动的预约名单），防止越权访问。
 
 ## 数据库设计
 
-### 表结构
+共 13 张表：`user`、`role`、`user_role`、`product`、`category`、`favorite`、`comment`、`order`、`activity`、`activity_category`、`reservation`（含候补表）、`notification`、`message_consume_record`
 
 | 表名 | 说明 | 核心字段 |
 |------|------|---------|
-| user | 用户表 | id, username, password(BCrypt), nickname, phone, avatar, role(0普通/1管理员), status(0禁用/1正常) |
-| product | 商品表 | id, title, description, price, original_price, image, category_id, seller_id, condition_level, status(0下架/1在售/2锁定/3已售/4待审核), view_count, review_remark |
-| category | 分类表 | id, name, icon, sort, status |
-| `order` | 订单表 | id, order_no, product_id, product_title/price/image(快照), buyer_id, seller_id, status(0待确认/1已确认/2已取消) |
-| favorite | 收藏表 | id, user_id, product_id（联合唯一索引防重复，物理删除） |
-| comment | 留言表 | id, product_id, user_id, content, parent_id(顶级留言为NULL), reply_to_user_id |
+| user | 用户表 | username, password(BCrypt), nickname, phone, avatar, status(0禁用/1正常), role(兼容旧字段) |
+| role | 角色表 | role_code(USER/ORGANIZER/AUDITOR/ADMIN), role_name |
+| user_role | 用户-角色关联 | user_id, role_id（联合唯一索引，物理删除） |
+| product | 商品表 | title, description, price, original_price, image, category_id, seller_id, condition_level, status(0下架/1��售/2锁定/3已售/4待审核), view_count, review_remark |
+| category | 商品分类表 | name, icon, sort, status |
+| favorite | 收藏表 | user_id, product_id（联合唯一索引防重复，物理删除） |
+| comment | 留言表 | product_id, user_id, content, parent_id(顶级为NULL), reply_to_user_id（逻辑删除） |
+| `order` | 订单表 | order_no, product_id, product_title/price/image(快照), buyer_id, seller_id, status(0待确认/1已确认/2已取消) |
+| activity | 活动表 | title, description, location, cover_image, category_id, start/end_time, enroll_start/end_time, max_count, current_count, status(0草稿~7已下架), organizer_id, reviewer_id, reject_reason（逻辑删除） |
+| activity_category | 活动分类表 | name, icon, sort, status |
+| reservation | 预约表 | user_id, activity_id, status(0已预约/1已取消/2已失效), active_mark(1有效/NULL无效) |
+| waiting_list | 候补表 | user_id, activity_id, position(排队位置), status(0候补中/1已补位/2已取消/3已失效), active_mark |
+| notification | 通知表 | user_id, type(1~7), title, content, related_id, is_read（无 deleted） |
+| message_consume_record | 消息消费记录 | event_id(唯一索引), queue_name, consume_status, error_msg |
 
-### 索引设计
+### 关键设计
 
-| 表 | 索引 | 用途 |
-|----|------|------|
-| product | idx_status_createtime (status, create_time) | 商品列表查询 + 排序 |
-| product | idx_categoryid_status (category_id, status) | 分类筛选 |
-| product | idx_sellerid_createtime (seller_id, create_time) | 我的商品列表 |
-| order | idx_buyerid_createtime (buyer_id, create_time) | 我买的订单 |
-| order | idx_sellerid_createtime (seller_id, create_time) | 我卖的订单 |
-| order | idx_status_createtime (status, create_time) | 超时订单扫描 |
-| favorite | uk_user_product (user_id, product_id) | 防重复收藏 |
-| comment | idx_productid_parentid (product_id, parent_id) | 商品留言/回复查询 |
-| comment | idx_userid_createtime (user_id, create_time) | 我的留言列表 |
+- **部分唯一索引技巧**：MySQL 不支持部分索引，但唯一索引允许多个 NULL。`reservation` 表用 `uk_user_activity_active (user_id, activity_id, active_mark)` 实现"同一用户对同一活动只有一条有效预约"——有效记录 `active_mark=1` 受唯一约束，取消后的历史记录 `active_mark=NULL` 不受约束。预约/候补表**不设 deleted 字段**，用 `status + active_mark` 表达有效性，保留完整历史供统计审计。
+- **联合索引设计**：针对高频查询设计复合索引（如 `idx_activity_status (activity_id, status, create_time)`、`idx_user_create (user_id, create_time)`），消除 filesort；每个 SQL 脚本内均附最左前缀命中说明。
+- **CHECK 约束**：`reservation`/`waiting_list` 表用 CHECK 保证 `status` 与 `active_mark` 的一致性（MySQL 8.0.16+）。
 
 ## 核心业务流程
 
-### 登录认证流程
+### 预约并发防超卖（四道防线）
 
 ```
-用户提交用户名密码
-  → 后端查询用户，BCrypt 校验密码
-  → 校验账号状态（封禁用户拒绝登录）
-  → 生成 UUID Token
-  → 用户信息存入 Redis Hash（key: login:user:{token}，TTL 30分钟）
-  → 返回 Token 给前端
-  → 后续请求携带 Authorization: Bearer {token}
-  → LoginInterceptor 从 Redis 取用户信息 → 存入 ThreadLocal
-  → 请求结束清理 ThreadLocal（防内存泄漏）
-  → 每次请求刷新 TTL（滑动过期）
+用户预约活动
+  → ① 业务校验：活动存在 / 状态=报名中 / 在报名时间内 / 不能自约 / 分页参数合法
+  → ② 代码层查重：查"是否已有有效预约"（拦住大多数串行重复请求）
+  → ③ 条件更新抢名额（并发核心）:
+       UPDATE activity SET current_count = current_count + 1
+       WHERE id = ? AND current_count < max_count AND status = 3
+     —— MySQL 行锁 + WHERE 条件保证并发下只有 1 人成功（防超卖）
+  → ④ 唯一索引兜底：两个请求同时通过查重又都抢到名额时，
+     第二个 INSERT 触发 uk_user_activity_active 冲突 → 事务整体回滚，名额自动还原
+  → 事务提交后发送"预约成功"通知事件（afterCommit，回滚则不发）
 ```
 
-### 商品发布与审核流程
+### 候补补位流程
 
 ```
-卖家发布商品
-  → 商品状态: PENDING_REVIEW(4)
-  → 管理员审核通过 → 商品状态: ON_SALE(1)，前台可见
-  → 管理员审核驳回 → 商品状态: OFF_SALE(0)，附驳回原因(review_remark)
+已预约用户取消预约（事务 A）
+  → 条件更新预约记录：status=0→1, active_mark=1→NULL（释放唯一约束）
+  → 条件更新活动：current_count - 1（gt 0 兜底防负数）
+  → 注册 afterCommit 回调（避免死锁：外层事务 A 还持有活动行锁，不能直接开补位事务）
+  → 事务 A 提交、行锁释放后，调用 promoteNext()（REQUIRES_NEW 独立事务）
+  → 悲观锁锁定活动行 → 查出候补队首（position 最小）→ 补位为正式预约，名额 +1
+  → 发送"候补补位成功"通知
 ```
 
-### 订单状态流转
+### RabbitMQ 消息架构
 
 ```
-买家下单
-  → 商品: ON_SALE(1) → LOCKED(2)    订单: PENDING(0)
-  → 条件更新: UPDATE product SET status=2 WHERE id=? AND status=1（防并发超卖）
+6 类站内通知事件共用一个主队列：
+  notification.exchange (Direct) → notification.queue
+  路由键：reservation.created / reservation.canceled / waitlist.joined
+         / waitlist.promoted / activity.reviewed / activity.upcoming
 
-卖家确认
-  → 商品: LOCKED(2) → SOLD(3)       订单: PENDING(0) → CONFIRMED(1)
+可靠性保障：
+  · 发布确认（publisher-confirm correlated）+ 发布返回（publisher-returns）
+  · 消息持久化（Exchange + Queue + Message 三持久化）
+  · 手动 ack（acknowledge-mode: manual）+ prefetch 10
+  · 临时失败 → 重试交换机 → TTL 重试队列（5/10/20 秒指数退避，最多 3 次）
+    → 仍失败 → 死信队列（供人工排查，不无限占用主队列）
+  · 消费幂等：消费者先 INSERT message_consume_record（event_id 唯一索引），
+    重复消息触发唯一键冲突 → 跳过，保证 at-least-once 下不重复生成通知
 
-买家/卖家取消
-  → 商品: LOCKED(2) → ON_SALE(1)    订单: PENDING(0) → CANCELED(2)
-
-超时自动取消（定时任务，每60秒扫描）
-  → 超过30分钟未确认的订单自动取消
-  → 条件更新: UPDATE `order` SET status=2 WHERE id=? AND status=0（防竞态）
-  → 释放商品: LOCKED(2) → ON_SALE(1)
+订单超时（延迟队列 + 定时任务双保险）：
+  下单 → 消息进入 order.timeout.delay.queue（TTL 30 分钟）
+       → TTL 到期经死信转发到 order.timeout.queue → 消费者执行取消
+  兜底：OrderTimeoutTask 每分钟扫描超时订单（条件更新防竞态）
 ```
+
+### 活动状态机
+
+```
+草稿(0) ──提交审核──▶ 待审核(1) ──审核通过──▶ 报名中(3) ──报名截止──▶ 报名结束(4) ──活动开始──▶ 进行中(5) ──活动结束──▶ 已结束(6)
+  │                    │                        │                  │
+  └──────────────┐     └──审核拒绝──▶ 审核拒绝(2) └──下架──▶ 已下架(7)  └──下架──▶ 已下架(7)
+                 │                          │
+                 └──管理员下架───────────────┘
+```
+
+所有状态变更（用户操作、定时任务推进）必须先通过 `ActivityStatus.canTransition(from, to)` 白名单校验，防止非法跳转。
 
 ### 商品缓存策略（Cache-Aside）
 
 ```
-读请求:
-  → 查 Redis（product:detail:{id}）
-  → Redis 异常 → 降级为查 MySQL（保证接口可用）
-  → 命中空值标记 "NULL" → 直接返回商品不存在（防穿透）
-  → 命中正常缓存 → 反序列化返回
-  → 未命中 → 查 MySQL → 商品不存在则缓存 "NULL"（TTL 5min）
-  → 商品存在 → 组装 VO → 写入 Redis（TTL = 30min + 随机0~9min）→ 返回
-
-写请求（修改/删除/上下架）:
-  → 更新 MySQL → 删除 Redis 缓存（try-catch 保护，删除失败不影响主流程）
-```
-
-### 留言模块（两级结构）
-
-```
-发表顶级留言: parentId = null → 直接对商品留言
-发表回复: parentId = 顶级留言ID → 平铺展示在顶级留言下方
-  → 强制两级：对"回复"再回复时，自动挂到根留言下（防无限嵌套）
-  → 校验：父留言必须存在 + 必须属于同一商品（防跨商品挂载）
+读：查 Redis（product:detail:{id}）→ 命中返回
+    → 未命中查 MySQL → 存在则写缓存（TTL = 30min + 随机0~9min 防雪崩）
+    → 不存在则缓存空值 "NULL"（TTL 5min 防穿透）
+    → Redis 异常时降级为直接查 MySQL（保证接口可用）
+写：更新 MySQL → 删除缓存（try-catch 保护，删除失败不影响主流程）
 ```
 
 ## 项目亮点
 
-1. **Redis Token 登录态**：无状态登录，支持滑动过期自动续期
-2. **轻量级 RBAC**：自定义 @PublicApi + @RequireRole 注解配合拦截器，无需引入完整 Spring Security
-3. **ThreadLocal 用户上下文**：请求级隔离，afterCompletion 中清理防内存泄漏
-4. **订单事务控制**：@Transactional 保证订单创建与商品状态修改的原子性
-5. **条件更新防并发**：UPDATE ... WHERE status=ON_SALE 防止同一商品被多人下单（乐观锁思想）
-6. **订单超时自动取消**：@Scheduled 定时扫描 + 条件更新防竞态 + 逐笔 try-catch 容错
-7. **商品快照**：订单记录下单时的标题、价格、图片，不受商品后续修改影响
-8. **Redis 商品缓存**：Cache-Aside + 空值缓存防穿透 + 随机 TTL 防雪崩 + 读写双向降级保护
-9. **商品审核制**：发布后需管理员审核通过才上架，驳回附原因
-10. **两级留言结构**：顶级留言 + 平铺回复，强制两级防无限嵌套，跨商品挂载校验
-11. **唯一索引防重复收藏**：数据库层面保证幂等性，物理删除避免逻辑删除+唯一索引冲突
-12. **联合索引优化**：针对高频查询设计复合索引，消除 filesort
-13. **统一响应 + 全局异常 + 错误码体系**：接口规范，前端对接友好
-14. **单元测试覆盖**：5 个 Service 层测试类，75+ 用例，Mockito + AssertJ
+1. **Spring Security 无状态 Token 认证**：Bearer Token + Redis Hash，支持滑动过期自动续期、封禁即时拦截、Token 反向索引强制下线
+2. **完整 RBAC 权限模型**：`user_role` 多对多 + URL 规则 + `@PreAuthorize` + Service 归属校验三层防护
+3. **预约防超卖四道防线**：业务校验 → 代码查重 → 条件更新抢名额 → 唯一索引兜底，层层设防
+4. **部分唯一索引技巧**：`active_mark` NULL 技巧实现"部分唯一约束"，兼顾唯一性与历史记录保留
+5. **候补自动补位**：afterCommit + REQUIRES_NEW 组合，避免"外层事务持有行锁 + 内层事务等待行锁"的死锁
+6. **RabbitMQ 消息可靠性**：TTL 重试队列指数退避 + 死信队列 + 手动确认 + 消费幂等，事件驱动异步解耦
+7. **订单超时双保险**：TTL 延迟队列（精确到消息级）+ 定时任务扫描兜底（条件更新防竞态）
+8. **条件更新防并发**：预约、订单、补位全部使用 `UPDATE ... WHERE 状态条件` 的原子操作，乐观锁思想贯穿
+9. **Redis 商品缓存**：Cache-Aside + 空值缓存防穿透 + 随机 TTL 防雪崩 + 读写双向降级保护
+10. **活动状态机白名单**：所有状态变更统一校验，定时任务也不绕过
+11. **N+1 优化**：列表页批量 selectByIds + 内存 Map 组装，避免循环查库
+12. **统一响应 + 全局异常 + 模块化错误码**：错误码按业务分段（8000 活动 / 9000 预约 / 9100 候补 / 9200 通知）
 
 ## 项目难点
 
-1. **并发下单**：两个用户同时购买同一商品，通过条件更新（乐观锁思想）解决，影响行数为 0 则说明已被抢
-2. **缓存一致性**：采用先更新 DB 再删缓存的 Cache-Aside 策略，极端情况下短暂不一致可接受
-3. **缓存穿透**：查询不存在的商品 ID 会反复打到 MySQL，通过缓存空值标记（短 TTL）解决
-4. **缓存雪崩**：大量缓存同时过期导致 MySQL 压力骤增，通过随机 TTL 偏移分散过期时间
-5. **Redis 降级**：Redis 故障时读写均降级（读走 MySQL，写跳过缓存清除），保证核心业务可用
-6. **订单状态机**：严格校验状态流转合法性，待确认→已确认/已取消，不允许非法跳转
-7. **超时取消竞态**：定时任务查出超时订单后、取消前卖家可能刚好确认，通过条件更新（WHERE status=PENDING）避免误伤
-8. **留言层级控制**：强制两级结构，对"回复"再回复时自动挂到根留言，避免无限嵌套
+1. **并发预约防超卖**：同一活动仅剩 1 个名额、100 人同时预约，通过条件更新 + 行锁保证仅 1 人成功，唯一索引兜底并发窗口
+2. **候补排队顺序**：加入候补需要"读 MAX(位置) → 算新位置 → 插入"三步，条件更新无法解决，改用 `SELECT ... FOR UPDATE` 悲观锁串行化
+3. **补位死锁规避**：取消预约事务还持有活动行锁时不能直接补位，通过 afterCommit 延迟到锁释放后再用 REQUIRES_NEW 独立事务补位
+4. **消息重复消费**：RabbitMQ at-least-once 投递，用 `message_consume_record` 唯一索引实现消费幂等
+5. **消息丢失**：三持久化 + 发布确认 + 手动 ack，临时故障走 TTL 重试，最终失败进死信队列
+6. **状态机一致性**：活动/预约/候补多状态机联动（活动结束 → 候补失效），定时任务批量清理
+7. **缓存一致性**：Cache-Aside 先更新 DB 再删缓存，配合防穿透/防雪崩/降级保护
+8. **越权访问**：接口层只校验角色，Service 层必须二次校验数据归属（组织者查名单、用户查通知）
 
 ## 单元测试
 
-| 测试类 | 用例数 | 覆盖内容 |
-|--------|--------|---------|
-| UserServiceImplTest | 15 | 注册、登录（成功/密码错/不存在/禁用）、登出、查询、管理员新增 |
-| ProductServiceImplTest | 14 | 发布、编辑、删除、详情（缓存命中/穿透/回源）、状态修改、列表、我的商品 |
-| OrderServiceImplTest | 14 | 下单（成功/不存在/自买/非在售/已锁定）、确认、取消、详情、买家/卖家列表 |
-| CategoryServiceImplTest | 11 | 添加（成功/默认值/重名）、修改（成功/不存在/重名/跳过检查）、删除、列表、详情 |
-| FavoriteServiceImplTest | 7 | 添加（成功/不存在/幂等）、取消（成功/未收藏）、状态查询、列表 |
+| 测试类 | 覆盖内容 |
+|--------|---------|
+| UserServiceImplTest | 注册、登录（成功/密码错/不存在/禁用）、登出、查询、管理员新增 |
+| ProductServiceImplTest | 发布、编辑、删除、详情（缓存命中/穿透/回源）、状态修改、列表、我的商品 |
+| OrderServiceImplTest | 下单（成功/不存在/自买/非在售/已锁定）、确认、取消、详情、买家/卖家列表 |
+| CategoryServiceImplTest | 添加（成功/默认值/重名）、修改、删除、列表、详情 |
+| FavoriteServiceImplTest | 添加（成功/不存在/幂等）、取消（成功/未收藏）、状态查询、列表 |
 
-测试策略：纯 Mockito 单元测试（不依赖 Spring 容器和数据库），通过反射注入 baseMapper，Mock 所有外部依赖，验证业务逻辑正确性。
+测试策略：纯 Mockito 单元测试（不依赖 Spring 容器和数据库），通过反射注入 baseMapper，Mock 外部依赖。活动/预约/候补模块的测试待补充。
 
 ## 本地启动
 
@@ -210,29 +270,32 @@ campus-trade/
 - JDK 21+
 - MySQL 8.x
 - Redis 7.x
+- RabbitMQ（本地推荐 Docker：`docker run -d --name campus-rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management`）
 - Maven 3.8+
 
 ### 启动步骤
 
-1. 创建数据库并执行 SQL 脚本：
+1. 创建数据库并执行 SQL 脚本（注意执行顺序）：
 
 ```bash
-# 在 MySQL 中创建数据库
 CREATE DATABASE campus_trade DEFAULT CHARACTER SET utf8mb4;
-
-# 依次执行 src/main/resources/db/ 下的 SQL 文件
-# user.sql → product.sql → category.sql → order.sql → favorite.sql → comment.sql
+# 依次执行 src/main/resources/db/ 下的脚本：
+# user.sql → role_v2.sql → category.sql → product.sql → order.sql
+# → favorite.sql → comment.sql → activity_category.sql → activity.sql
+# → reservation.sql → notification.sql → message_consume_record.sql
+# （脚本均可重复执行，已内置 IF NOT EXISTS 与幂等迁移）
 ```
 
-2. 配置环境变量（或直接修改 application-dev.yaml）：
+2. 配置环境变量（避免明文密码提交到 Git）：
 
 ```bash
-# 推荐通过环境变量注入数据库密码（避免明文提交到 Git）
 set DB_USERNAME=root
 set DB_PASSWORD=你的密码
+set RABBITMQ_USERNAME=campus_admin
+set RABBITMQ_PASSWORD=你的RabbitMQ密码
 ```
 
-3. 修改配置文件 `src/main/resources/application-dev.yaml`：
+3. 修改 `src/main/resources/application-dev.yaml`：
 
 ```yaml
 spring:
@@ -240,10 +303,18 @@ spring:
     redis:
       host: localhost
       port: 6379
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: ${RABBITMQ_USERNAME:campus_admin}
+    password: ${RABBITMQ_PASSWORD:ChangeMe_Rabbit_2026!}
+    virtual-host: campus_trade
 
 upload:
   path: D:/campus-trade-uploads   # 改成你的图片存储路径
 ```
+
+> 注意：RabbitMQ 需先创建 `campus_trade` virtual-host 及 `campus_admin` 用户并授权，或直接修改上述配置使用默认 vhost。
 
 4. 启动项目：
 
@@ -259,21 +330,18 @@ http://localhost:8080/doc.html
 
 ## 接口文档
 
-启动项目后访问 Knife4j 文档页面：
+启动项目后访问 Knife4j 文档页面：`http://localhost:8080/doc.html`（Swagger UI：`/swagger-ui.html`）
 
-```
-http://localhost:8080/doc.html
-```
-
-包含 7 个模块共 40+ 个接口的完整文档，支持在线调试。
+包含 14 个 Controller 共约 68 个接口的完整文档，支持在线调试。接口按业务模块分组：用户、商品、分类、订单、收藏、留言、管理后台、上传、活动、活动分类、预约、候补、通知。
 
 ## 后续优化方向
 
-- [ ] 接入 Elasticsearch 实现全文搜索（替代 MySQL LIKE）
-- [ ] 订单超时取消升级为 RabbitMQ 延迟队列（更高精度）
-- [ ] Docker 容器化部署（Dockerfile + docker-compose）
-- [ ] JMeter 压测 + 性能优化记录
+- [ ] 活动/预约/候补模块单元测试（当前仅覆盖旧交易模块）
+- [ ] Testcontainers 集成测试（真实 MySQL/Redis/RabbitMQ 验证并发与幂等）
 - [ ] 前端页面（Vue 3）
-- [ ] 站内消息通知（订单状态变更、审核结果推送）
-- [ ] 商品多图支持（当前为单图）
-- [ ] 接口限流（pageSize 上限、频率限制）
+- [ ] Docker 容器化部署（Dockerfile + docker-compose，MySQL/Redis/RabbitMQ/应用）
+- [ ] GitHub Actions CI（mvn -B clean test）
+- [ ] 活动列表接入缓存（当前仅商品详情有缓存）
+- [ ] 接口限流与防重复提交（Redis 幂等 Token）
+- [ ] 活动热度排行（Redis ZSet）
+- [ ] JMeter 压测 + 性能优化记录

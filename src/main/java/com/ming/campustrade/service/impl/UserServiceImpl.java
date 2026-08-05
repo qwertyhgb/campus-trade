@@ -23,6 +23,7 @@ import com.ming.campustrade.entity.Product;
 import com.ming.campustrade.entity.User;
 import com.ming.campustrade.mapper.ProductMapper;
 import com.ming.campustrade.mapper.UserMapper;
+import com.ming.campustrade.mapper.UserRoleMapper;
 import com.ming.campustrade.service.ProductCacheService;
 import com.ming.campustrade.service.UserService;
 import com.ming.campustrade.utils.UserHolder;
@@ -62,7 +63,7 @@ import lombok.extern.slf4j.Slf4j;
  *       用户登录时，用 matches() 方法比对明文和密文，验证密码是否正确。</li>
  *   <li><b>StringRedisTemplate</b> —— Spring Data Redis 提供的操作模板。
  *       登录成功后，把用户信息以 Redis Hash 结构缓存起来，
- *       后续请求只需携带 token，拦截器从 Redis 中取出用户信息放入 ThreadLocal，
+ *       后续请求只需携带 token，TokenAuthenticationFilter 从 Redis 中取出用户信息放入 ThreadLocal，
  *       实现无状态登录（服务端不存 Session，靠 Redis 存登录态）。</li>
  * </ul>
  *
@@ -113,6 +114,12 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     private final ProductCacheService productCacheService;
 
     /**
+     * 用户-角色关联 Mapper，登录时查询用户拥有的角色编码列表，
+     * 写入 Redis 登录态的 roles 字段，供 TokenAuthenticationFilter 构建权限。
+     */
+    private final UserRoleMapper userRoleMapper;
+
+    /**
      * 构造器注入
      *
      * <p>Spring 启动时发现 UserServiceImpl 需要这些类型的 Bean，
@@ -126,13 +133,16 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      * @param passwordEncoder BCrypt 密码加密器
      * @param productMapper   商品数据访问层
      * @param productCacheService 商品详情缓存组件
+     * @param userRoleMapper  用户-角色关联数据访问层
      */
     public UserServiceImpl(StringRedisTemplate redisTemplate, BCryptPasswordEncoder passwordEncoder,
-                           ProductMapper productMapper, ProductCacheService productCacheService) {
+                           ProductMapper productMapper, ProductCacheService productCacheService,
+                           UserRoleMapper userRoleMapper) {
         this.stringRedisTemplate = Objects.requireNonNull(redisTemplate, "redisTemplate 不能为 null");
         this.passwordEncoder = Objects.requireNonNull(passwordEncoder, "passwordEncoder 不能为 null");
         this.productMapper = Objects.requireNonNull(productMapper, "productMapper 不能为 null");
         this.productCacheService = Objects.requireNonNull(productCacheService, "productCacheService 不能为 null");
+        this.userRoleMapper = Objects.requireNonNull(userRoleMapper, "userRoleMapper 不能为 null");
     }
 
     // ==================== 管理员：查询所有用户 ====================
@@ -347,7 +357,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      *
      * <p><b>为什么用 Redis Hash 而不是 String（JSON）？</b><br>
      * Hash 结构可以单独读写某个字段（HGET/HSET），不需要每次取出整个对象再反序列化。
-     * 比如拦截器只需要取 username 时，直接 HGET key username 即可，性能更好。
+     * 比如过滤器只需要取 username 时，直接 HGET key username 即可，性能更好。
      * 而且 Hash 在字段少时比 String 更省内存（Redis 内部用 ziplist 编码）。</p>
      *
      * @param userLoginDTO 登录请求参数（用户名、密码）
@@ -409,6 +419,12 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         userMap.put("status", String.valueOf(userVO.getStatus() != null ? userVO.getStatus() : 1));
         userMap.put("role", String.valueOf(userVO.getRole() != null ? userVO.getRole() : 0));
 
+        // 4.3.1 查询用户角色编码列表，拼接成逗号分隔字符串写入 roles 字段
+        //       供 TokenAuthenticationFilter 第 9 步读取并构建 Spring Security 权限
+        //       例如：["USER", "ADMIN"] → "USER,ADMIN"；无角色时为空字符串
+        List<String> roleCodes = userRoleMapper.selectRoleCodesByUserId(userVO.getId());
+        userMap.put("roles", String.join(",", roleCodes));
+
         // 4.4 写入 Redis Hash
         //     opsForHash().putAll() 等价于 Redis 命令：HSET tokenKey id xxx username xxx ...
         //     一次网络往返写入所有字段，比逐个 HSET 性能更好
@@ -416,7 +432,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
 
         // 4.5 设置过期时间（滑动 TTL 的初始值）
         //     Duration.ofMinutes(N) 表示 N 分钟后自动过期
-        //     为什么叫"滑动 TTL"？因为拦截器每次验证 token 时会刷新过期时间（续期），
+        //     为什么叫"滑动 TTL"？因为过滤器每次验证 token 时会刷新过期时间（续期），
         //     只要用户持续活跃，token 就不会过期；一旦用户长时间不操作，token 自动失效。
         //     这比固定过期时间更友好——不会在用户操作到一半时突然踢出登录。
         stringRedisTemplate.expire(tokenKey, Duration.ofMinutes(RedisConstants.LOGIN_USER_TTL));
@@ -450,7 +466,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      *
      * <p><b>退出登录的本质是什么？</b><br>
      * 就是删除 Redis 中 token 对应的 Hash 数据。删除后，后续请求携带这个 token
-     * 在拦截器中查 Redis 就查不到了，等同于"未登录"状态。
+     * 在过滤器中查 Redis 就查不到了，等同于"未登录"状态。
      * 这是一种"服务端主动失效"的方式，比等 token 自然过期更及时。</p>
      *
      * @param token 前端传来的 Authorization 头（可能带 "Bearer " 前缀）
@@ -511,9 +527,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      * </ol>
      *
      * <p><b>为什么要同步更新 Redis 登录态？（关键）</b><br>
-     * 本项目的登录态存在 Redis Hash 中（login 时写入）。每次请求，LoginInterceptor
+     * 本项目的登录态存在 Redis Hash 中（login 时写入）。每次请求，TokenAuthenticationFilter
      * 都是从 Redis 读取用户信息放进 ThreadLocal。如果只改了数据库和 ThreadLocal，
-     * 而不改 Redis，那么本次请求结束后 ThreadLocal 被清理，下次请求拦截器从 Redis
+     * 而不改 Redis，那么本次请求结束后 ThreadLocal 被清理，下次请求过滤器从 Redis
      * 读到的还是旧昵称/旧头像——用户会发现自己"改了等于没改"。
      * 所以必须把变更同步到 Redis Hash，登录态才与数据库保持一致。</p>
      *
@@ -529,7 +545,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     @Override
     public void updateProfile(UserProfileUpdateDTO dto, String token) {
         // ===== 第 1 步：获取当前登录用户并查出实体 =====
-        // 从 ThreadLocal 拿用户 ID（由拦截器注入，不可伪造），而不是从参数传，防止越权改别人资料
+        // 从 ThreadLocal 拿用户 ID（由过滤器注入，不可伪造），而不是从参数传，防止越权改别人资料
         Long userId = UserHolder.getUserVO().getId();
         log.info("修改个人资料：userId={}", userId);
 
@@ -566,7 +582,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         currentUser.setAvatar(existUser.getAvatar());
         currentUser.setPhone(existUser.getPhone());
 
-        // 4.2 同步 Redis Hash：保证下次请求拦截器读到的也是最新资料
+        // 4.2 同步 Redis Hash：保证下次请求过滤器读到的也是最新资料
         refreshLoginUserInRedis(token, existUser);
     }
 
@@ -622,7 +638,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      * </ol>
      *
      * <p><b>为什么从 ThreadLocal 取 userId 而不是从参数传？</b><br>
-     * 与 {@link #updateProfile} 同理：userId 由拦截器从 Redis 登录态解析后注入 ThreadLocal，
+     * 与 {@link #updateProfile} 同理：userId 由过滤器从 Redis 登录态解析后注入 ThreadLocal，
      * 不可被前端伪造。如果从请求参数传 userId，攻击者可以传别人的 ID 去改别人的密码，
      * 这是严重的越权漏洞。从 ThreadLocal 取能保证"只能改自己的密码"。</p>
      *
@@ -647,7 +663,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     @Override
     public void updatePassword(UserPasswordUpdateDTO dto) {
         // ===== 第 1 步：获取当前登录用户并查出实体 =====
-        // 从 ThreadLocal 拿用户 ID（由拦截器注入，不可伪造），防止越权改他人密码
+        // 从 ThreadLocal 拿用户 ID（由过滤器注入，不可伪造），防止越权改他人密码
         Long userId = UserHolder.getUserVO().getId();
         log.info("修改密码：userId={}", userId);
 
@@ -753,12 +769,12 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         //    再删除集合本身，让用户立即下线。
         forceLogoutAll(id);
 
-        // 6. 写入封禁标记：即使有 token 因 Redis 抖动残留，拦截器检查到此标记也会立即拒绝
+        // 6. 写入封禁标记：即使有 token 因 Redis 抖动残留，过滤器检查到此标记也会立即拒绝
         //    这是比删除 token 更可靠的“即时生效”手段（不依赖反向索引是否完整）。
         try {
             stringRedisTemplate.opsForValue().set(RedisConstants.LOGIN_DISABLED_KEY + id, "1");
         } catch (Exception e) {
-            log.warn("写入封禁标记失败（拦截器仍会靠 status 兑底）：userId={}", id, e);
+            log.warn("写入封禁标记失败（过滤器仍会靠 status 兜底）：userId={}", id, e);
         }
 
         log.info("封禁用户成功：targetUserId={}, 同步下架商品{}件，已强制下线", id, takenDown);
@@ -773,7 +789,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      * <p><b>为什么用 try-catch 包裹？</b><br>
      * 封禁的核心动作（改 status、下架商品）已完成。删除 Redis 登录态若因 Redis
      * 抖动失败，不应让整个封禁接口报 500。即使个别 token 残留，
-     * 登录拦截器的防御性校验（拒绝 status=0 的用户）也会兑底，不会漏放。</p>
+     * 过滤器的防御性校验（拒绝 status=0 的用户）也会兜底，不会漏放。</p>
      *
      * @param userId 要强制下线的用户 ID
      */
@@ -789,7 +805,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             stringRedisTemplate.delete(userTokensKey);
             log.info("已强制用户下线：userId={}, 清理token{}个", userId, tokens == null ? 0 : tokens.size());
         } catch (Exception e) {
-            log.warn("强制下线失败（拦截器防御校验会兑底）：userId={}", userId, e);
+            log.warn("强制下线失败（过滤器防御校验会兜底）：userId={}", userId, e);
         }
     }
 
