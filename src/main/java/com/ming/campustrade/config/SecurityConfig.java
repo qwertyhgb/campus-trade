@@ -29,7 +29,8 @@ import jakarta.annotation.Resource;
  *
  * <p>【过滤器链上的执行顺序（关键）】
  * 请求到达时按顺序经过：
- * TokenAuthenticationFilter（认证）→ 授权过滤器（按下方规则判断能否访问）
+ * TraceIdFilter（追踪ID）→ RateLimitFilter（限流）→ TokenAuthenticationFilter（认证）→ 授权过滤器
+ * 追踪 ID 在最前：让整条链共享同一个 traceId；限流其次：超限请求直接 429，不做认证；
  * 认证在前、授权在后，先知道“你是谁”，才能判断“你能干什么”。</p>
  */
 @Configuration
@@ -47,6 +48,22 @@ public class SecurityConfig {
      */
     @Resource
     private TokenAuthenticationFilter tokenAuthenticationFilter;
+
+    /**
+     * 限流过滤器：按 IP + 场景做固定窗口限流（登录、活动公开查询）。
+     * 通过 addFilterBefore 插入到 TokenAuthenticationFilter 之前 ——
+     * 限流必须最先执行：被限流的请求根本不需要做认证，省下 Redis/数据库开销。
+     */
+    @Resource
+    private RateLimitFilter rateLimitFilter;
+
+    /**
+     * 请求追踪 ID 过滤器：为每个请求生成 traceId 写入 MDC 并返回响应头。
+     * 插入到限流过滤器之前 —— 它是链路最前端，保证所有后续环节
+     * （限流、认证、业务、审计日志）都带有同一个 traceId。
+     */
+    @Resource
+    private TraceIdFilter traceIdFilter;
 
     /**
      * 401/403 响应处理器：未登录返回 {"code":401,"msg":"请先登录"}，
@@ -83,6 +100,14 @@ public class SecurityConfig {
             // 为什么插在这里？UsernamePasswordAuthenticationFilter 是 Security 内置的
             // 表单登录过滤器（已禁用），把它当作“位置锚点”：我们的认证逻辑要先于它执行
             .addFilterBefore(tokenAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+
+            // 把 RateLimitFilter 插到 TokenAuthenticationFilter 之前：
+            // 限流是第一道门 —— 超限的请求直接 429，根本不需要认证
+            .addFilterBefore(rateLimitFilter, TokenAuthenticationFilter.class)
+
+            // 把 TraceIdFilter 插到限流过滤器之前：链路最前端，
+            // 保证限流、认证、业务与审计日志都带有同一个 traceId
+            .addFilterBefore(traceIdFilter, RateLimitFilter.class)
 
             // 定制 401/403 响应（Security 默认返回 302 跳转或 HTML，前端要 JSON）
             // authenticationEntryPoint：未登录访问受保护接口 → 401
@@ -121,8 +146,9 @@ public class SecurityConfig {
 
                 // 活动模块：/activity/my 是当前用户私有数据，必须放在公开详情规则之前
                 .requestMatchers(HttpMethod.GET, "/activity/my").authenticated()
-                // 活动列表和活动详情公开，便于未登录用户浏览校园活动
-                .requestMatchers(HttpMethod.GET, "/activity/list", "/activity/{id}").permitAll()
+                // 活动列表、详情和热门榜单公开，便于未登录用户浏览校园活动
+                // 注意：/activity/hot 显式声明，避免依赖 /activity/{id} 的变量匹配规则
+                .requestMatchers(HttpMethod.GET, "/activity/list", "/activity/{id}", "/activity/hot").permitAll()
 
                 // 留言模块：看商品留言、看回复公开（浏览商品详情页就能看到留言）；发/删留言需要登录
                 .requestMatchers(HttpMethod.GET, "/comment/product/{productId}",
@@ -185,6 +211,39 @@ public class SecurityConfig {
     public FilterRegistrationBean<TokenAuthenticationFilter> tokenFilterRegistration(
             TokenAuthenticationFilter filter) {
         FilterRegistrationBean<TokenAuthenticationFilter> registration =
+                new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
+    }
+
+    /**
+     * 同样禁用 RateLimitFilter 的 Servlet 自动注册。
+     *
+     * <p>它与 TokenAuthenticationFilter 情况相同：既是 @Component（会被 Spring Boot
+     * 自动注册进 Servlet 容器），又通过 addFilterBefore 加入了 Security 过滤器链。
+     * 如果不禁用自动注册，同一个请求会被执行两次 doFilterInternal ——
+     * 限流计数会翻倍，正常用户可能被提前误杀。必须 setEnabled(false)。</p>
+     */
+    @Bean
+    public FilterRegistrationBean<RateLimitFilter> rateLimitFilterRegistration(
+            RateLimitFilter filter) {
+        FilterRegistrationBean<RateLimitFilter> registration =
+                new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
+    }
+
+    /**
+     * 同样禁用 TraceIdFilter 的 Servlet 自动注册。
+     *
+     * <p>与另外两个过滤器相同：既是 @Component 又加入了 Security 链，
+     * 不禁用自动注册会被执行两次 —— traceId 被重复生成、
+     * MDC 清理时机错乱，必须 setEnabled(false)。</p>
+     */
+    @Bean
+    public FilterRegistrationBean<TraceIdFilter> traceIdFilterRegistration(
+            TraceIdFilter filter) {
+        FilterRegistrationBean<TraceIdFilter> registration =
                 new FilterRegistrationBean<>(filter);
         registration.setEnabled(false);
         return registration;

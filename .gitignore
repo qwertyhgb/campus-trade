@@ -45,3 +45,9 @@ nul
 
 ### WorkBuddy workspace memory ###
 .workbuddy/
+
+### Runtime logs ###
+logs/
+
+### Local uploads ###
+.uploads/

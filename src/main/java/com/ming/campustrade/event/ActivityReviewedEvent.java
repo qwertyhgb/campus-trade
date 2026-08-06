@@ -14,7 +14,7 @@ import lombok.EqualsAndHashCode;
  * 消费者组装通知内容时需要知道审核结果：</p>
  * <ul>
  *   <li>{@code passed = true} → 通知内容：您的活动已通过审核并上架</li>
- *   <li>{@code passed = false} → 通知内容需包含驳回原因：您的活动审核未通过，原因：XXX</li>
+ *   <li>{@code passed = false} → 通知内容需包含驳回原因：您的活动审核未通过，原因：活动时间配置不合法</li>
  * </ul>
  * <p>如果事件里不带这些字段，消费者就得再查一次数据库才能拿到审核结果，
  * 增加一次不必要的查询。</p>

@@ -3,7 +3,12 @@ package com.ming.campustrade.controller;
 import java.util.List;
 
 import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.ming.campustrade.annotation.OperationLog;
 import com.ming.campustrade.common.Result;
+import com.ming.campustrade.common.ResultCode;
+import com.ming.campustrade.common.constant.IdempotencyScene;
+import com.ming.campustrade.common.exception.BusinessException;
+import com.ming.campustrade.service.IdempotencyTokenService;
 import com.ming.campustrade.service.ReservationService;
 import com.ming.campustrade.vo.ReservationVO;
 
@@ -21,6 +26,7 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -46,25 +52,44 @@ public class ReservationController {
     private final ReservationService reservationService;
 
     /**
+     * 幂等 Token 服务：预约接口在执行业务前先原子消费 Token，防止重复提交。
+     */
+    private final IdempotencyTokenService idempotencyTokenService;
+
+    /**
      * 构造器注入：Spring 启动时自动把 ReservationService 的实现类实例传进来。
      */
-    public ReservationController(ReservationService reservationService) {
+    public ReservationController(ReservationService reservationService,
+                                 IdempotencyTokenService idempotencyTokenService) {
         this.reservationService = reservationService;
+        this.idempotencyTokenService = idempotencyTokenService;
     }
 
     /**
      * 预约活动（需登录）。
      *
      * <p>核心并发控制：防重复、防超额、防非法时间、防自约，
-     * 具体逻辑在 ReservationService.reserve() 中实现。</p>
+     * 具体逻辑在 ReservationService.reserve() 中实现。
+     * <b>幂等保护：</b>请求头必须携带 Idempotency-Token（从 POST /idempotency/token/activity:reserve
+     * 领取），Token 每次提交只能用一次，防止连续点击重复预约。</p>
      *
      * @param activityId 活动 ID（路径变量）
      * @return 统一响应结果（无数据体）
      */
-    @Operation(summary = "预约活动", description = "用户预约活动（需登录），含防重复/防超额/防非法时间/防自约校验")
+    @Operation(summary = "预约活动", description = "用户预约活动（需登录），含防重复/防超额/防非法时间/防自约校验；"
+            + "必须携带 Idempotency-Token 请求头（从 POST /idempotency/token/activity:reserve 领取，每次提交只能用一次）")
+    @OperationLog(action = "RESERVATION_CREATE", targetType = "activity", targetIdParam = "activityId", description = "预约活动")
     @PostMapping("/{activityId}")
-    public Result<Void> reserve(@Parameter(description = "活动ID") @PathVariable Long activityId) {
+    public Result<Void> reserve(
+            @Parameter(description = "活动ID") @PathVariable Long activityId,
+            @Parameter(description = "幂等 Token：从 POST /idempotency/token/activity:reserve 领取")
+            @RequestHeader(value = "Idempotency-Token", required = false) String idempotencyToken) {
         log.info("预约活动：activityId={}", activityId);
+        // 先原子消费幂等 Token，再执行业务：防止连续点击重复预约
+        // 请求头缺失/Token 过期/已被使用统一返回 IDEMPOTENCY_TOKEN_INVALID
+        if (!idempotencyTokenService.consumeToken(IdempotencyScene.ACTIVITY_RESERVE, idempotencyToken)) {
+            throw new BusinessException(ResultCode.IDEMPOTENCY_TOKEN_INVALID);
+        }
         reservationService.reserve(activityId);
         return Result.success();
     }
@@ -78,6 +103,7 @@ public class ReservationController {
      * @return 统一响应结果（无数据体）
      */
     @Operation(summary = "取消预约", description = "用户取消自己的预约（需登录），释放活动名额")
+    @OperationLog(action = "RESERVATION_CANCEL", targetType = "activity", targetIdParam = "activityId", description = "取消预约")
     @DeleteMapping("/{activityId}")
     public Result<Void> cancel(@Parameter(description = "活动ID") @PathVariable Long activityId) {
         log.info("取消预约：activityId={}", activityId);

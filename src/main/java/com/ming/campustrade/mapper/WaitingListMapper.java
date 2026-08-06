@@ -36,6 +36,21 @@ public interface WaitingListMapper extends BaseMapper<WaitingList> {
                                @Param("activityId") Long activityId);
 
     /**
+     * 统计某个活动当前有效候补的人数。
+     *
+     * <p>只统计 WAITING（status=0）且 active_mark=1 的候补记录，
+     * 已补位、已取消和已失效的历史候补不会计入。</p>
+     *
+     * @param activityId 活动 ID
+     * @return 当前有效候补人数，没有记录时返回 0
+     */
+    @Select("SELECT COUNT(*) FROM waiting_list "
+            + "WHERE activity_id = #{activityId} "
+            + "AND status = 0 "
+            + "AND active_mark = 1")
+    Integer countActiveWaitingByActivityId(@Param("activityId") Long activityId);
+
+    /**
      * 查询某个活动当前有效候补队列中的最大位置。
      *
      * <p>没有候补记录时，SQL 的 MAX 会返回 null，后续 Service 层应把 null

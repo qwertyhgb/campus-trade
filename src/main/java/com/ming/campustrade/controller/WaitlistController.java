@@ -2,7 +2,12 @@ package com.ming.campustrade.controller;
 
 import java.util.List;
 
+import com.ming.campustrade.annotation.OperationLog;
 import com.ming.campustrade.common.Result;
+import com.ming.campustrade.common.ResultCode;
+import com.ming.campustrade.common.constant.IdempotencyScene;
+import com.ming.campustrade.common.exception.BusinessException;
+import com.ming.campustrade.service.IdempotencyTokenService;
 import com.ming.campustrade.service.WaitlistService;
 import com.ming.campustrade.vo.WaitlistVO;
 
@@ -19,6 +24,7 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -44,27 +50,45 @@ public class WaitlistController {
     private final WaitlistService waitlistService;
 
     /**
+     * 幂等 Token 服务：加入候补接口在执行业务前先原子消费 Token，防止重复提交。
+     */
+    private final IdempotencyTokenService idempotencyTokenService;
+
+    /**
      * 构造器注入：Spring 启动时自动把 WaitlistService 的实现类实例传进来。
      */
-    public WaitlistController(WaitlistService waitlistService) {
+    public WaitlistController(WaitlistService waitlistService,
+                              IdempotencyTokenService idempotencyTokenService) {
         this.waitlistService = waitlistService;
+        this.idempotencyTokenService = idempotencyTokenService;
     }
 
     /**
      * 加入候补队列（需登录）。
      *
      * <p>活动名额已满时调用。并发控制由 Service 层的悲观锁（FOR UPDATE）
-     * + 唯一索引兜底完成，保证排队位置不重复、顺序公平。</p>
+     * + 唯一索引兜底完成，保证排队位置不重复、顺序公平。
+     * <b>幂等保护：</b>请求头必须携带 Idempotency-Token（从 POST /idempotency/token/activity:waitlist
+     * 领取），Token 每次提交只能用一次，防止连续点击重复加入候补。</p>
      *
      * @param activityId 活动 ID（路径变量）
      * @return 统一响应结果（无数据体）
      */
-    @Operation(summary = "加入候补", description = "活动满员时用户加入候补队列（需登录），含满员/防重复/防自约校验")
+    @Operation(summary = "加入候补", description = "活动满员时用户加入候补队列（需登录），含满员/防重复/防自约校验；"
+            + "必须携带 Idempotency-Token 请求头（从 POST /idempotency/token/activity:waitlist 领取，每次提交只能用一次）")
+    @OperationLog(action = "WAITLIST_JOIN", targetType = "activity", targetIdParam = "activityId", description = "加入候补")
     @PostMapping("/{activityId}")
     public Result<Void> join(
             @Parameter(description = "活动ID")
-            @PathVariable @Min(value = 1, message = "活动ID必须大于0") Long activityId) {
+            @PathVariable @Min(value = 1, message = "活动ID必须大于0") Long activityId,
+            @Parameter(description = "幂等 Token：从 POST /idempotency/token/activity:waitlist 领取")
+            @RequestHeader(value = "Idempotency-Token", required = false) String idempotencyToken) {
         log.info("加入候补：activityId={}", activityId);
+        // 先原子消费幂等 Token，再执行业务：防止连续点击重复加入候补
+        // 请求头缺失/Token 过期/已被使用统一返回 IDEMPOTENCY_TOKEN_INVALID
+        if (!idempotencyTokenService.consumeToken(IdempotencyScene.ACTIVITY_WAITLIST, idempotencyToken)) {
+            throw new BusinessException(ResultCode.IDEMPOTENCY_TOKEN_INVALID);
+        }
         waitlistService.joinWaitlist(activityId);
         return Result.success();
     }
@@ -78,6 +102,7 @@ public class WaitlistController {
      * @return 统一响应结果（无数据体）
      */
     @Operation(summary = "取消候补", description = "用户取消自己的候补（需登录），释放排队位置")
+    @OperationLog(action = "WAITLIST_CANCEL", targetType = "activity", targetIdParam = "activityId", description = "取消候补")
     @DeleteMapping("/{activityId}")
     public Result<Void> cancel(
             @Parameter(description = "活动ID")

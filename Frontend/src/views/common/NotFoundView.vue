@@ -1,0 +1,2 @@
+<template><main class="not-found"><div class="section-card content"><span>404</span><h1>页面不存在</h1><p>请检查访问地址，或返回首页继续浏览。</p><RouterLink :to="{ name: 'home' }"><el-button type="primary">返回首页</el-button></RouterLink></div></main></template>
+<style scoped>.not-found { display: grid; min-height: 100vh; place-items: center; padding: 24px; }.content { display: grid; place-items: center; gap: 12px; padding: 48px; text-align: center; }.content span { color: #2563eb; font-size: 54px; font-weight: 800; }.content h1, .content p { margin: 0; }.content p { color: #64748b; }</style>

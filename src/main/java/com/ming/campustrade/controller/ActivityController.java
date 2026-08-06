@@ -4,6 +4,7 @@ import java.util.List;
 
 import jakarta.annotation.Resource;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 
 import lombok.extern.slf4j.Slf4j;
@@ -16,16 +17,23 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.ming.campustrade.annotation.OperationLog;
 import com.ming.campustrade.common.Result;
+import com.ming.campustrade.common.ResultCode;
+import com.ming.campustrade.common.constant.IdempotencyScene;
+import com.ming.campustrade.common.exception.BusinessException;
 import com.ming.campustrade.dto.ActivityCreateDTO;
 import com.ming.campustrade.dto.ActivityQueryDTO;
 import com.ming.campustrade.dto.ActivityReviewDTO;
 import com.ming.campustrade.dto.ActivityUpdateDTO;
 import com.ming.campustrade.service.ActivityService;
+import com.ming.campustrade.service.IdempotencyTokenService;
 import com.ming.campustrade.vo.ActivityDetailVO;
 import com.ming.campustrade.vo.ActivityListItemVO;
 
@@ -66,15 +74,35 @@ public class ActivityController {
     private ActivityService activityService;
 
     /**
+     * 幂等 Token 服务：写接口（创建活动）在执行业务前先原子消费 Token，防止重复提交。
+     */
+    @Resource
+    private IdempotencyTokenService idempotencyTokenService;
+
+    /**
      * 创建活动。
      *
-     * <p>创建成功后返回数据库生成的活动 ID，前端可以使用该 ID 继续编辑或提交审核。</p>
+     * <p>创建成功后返回数据库生成的活动 ID，前端可以使用该 ID 继续编辑或提交审核。
+     * <b>幂等保护：</b>请求头必须携带 Idempotency-Token（从 POST /idempotency/token/activity:create
+     * 领取），Token 每次提交只能用一次，防止连续点击重复创建活动。</p>
      */
-    @Operation(summary = "创建活动", description = "组织者或管理员创建活动，活动初始状态为草稿，并返回活动ID")
+    @Operation(summary = "创建活动", description = "组织者或管理员创建活动，活动初始状态为草稿，并返回活动ID；"
+            + "必须携带 Idempotency-Token 请求头（从 POST /idempotency/token/activity:create 领取，每次提交只能用一次）")
     @PreAuthorize("hasAnyRole('ORGANIZER', 'ADMIN')")
+    // 创建前没有 activityId；成功后由切面从 Result.data（新生成的活动 ID）补入审计日志。
+    @OperationLog(action = "ACTIVITY_CREATE", targetType = "activity", description = "创建活动",
+            targetIdFromResult = true)
     @PostMapping("/create")
-    public Result<Long> create(@RequestBody @Valid ActivityCreateDTO dto) {
+    public Result<Long> create(
+            @RequestBody @Valid ActivityCreateDTO dto,
+            @Parameter(description = "幂等 Token：从 POST /idempotency/token/activity:create 领取")
+            @RequestHeader(value = "Idempotency-Token", required = false) String idempotencyToken) {
         log.info("创建活动请求：title={}, categoryId={}", dto.getTitle(), dto.getCategoryId());
+        // 先原子消费幂等 Token，再执行业务：防止连续点击重复创建
+        // 请求头缺失/Token 过期/已被使用统一返回 IDEMPOTENCY_TOKEN_INVALID
+        if (!idempotencyTokenService.consumeToken(IdempotencyScene.ACTIVITY_CREATE, idempotencyToken)) {
+            throw new BusinessException(ResultCode.IDEMPOTENCY_TOKEN_INVALID);
+        }
         Long activityId = activityService.createActivity(dto);
         log.info("创建活动成功：activityId={}", activityId);
         return Result.success(activityId);
@@ -88,6 +116,7 @@ public class ActivityController {
      */
     @Operation(summary = "编辑活动", description = "组织者或管理员编辑活动，只有草稿/审核拒绝状态允许修改")
     @PreAuthorize("hasAnyRole('ORGANIZER', 'ADMIN')")
+    @OperationLog(action = "ACTIVITY_UPDATE", targetType = "activity", targetIdParam = "dto.id", description = "编辑活动")
     @PutMapping("/update")
     public Result<Void> update(@RequestBody @Valid ActivityUpdateDTO dto) {
         log.info("编辑活动请求：activityId={}", dto.getId());
@@ -103,6 +132,7 @@ public class ActivityController {
      */
     @Operation(summary = "删除活动", description = "组织者或管理员删除活动，实际执行逻辑删除")
     @PreAuthorize("hasAnyRole('ORGANIZER', 'ADMIN')")
+    @OperationLog(action = "ACTIVITY_DELETE", targetType = "activity", targetIdParam = "id", description = "删除活动")
     @DeleteMapping("/{id}")
     public Result<Void> delete(
             @Parameter(description = "活动ID")
@@ -118,6 +148,7 @@ public class ActivityController {
      */
     @Operation(summary = "提交活动审核", description = "组织者提交草稿或审核拒绝的活动，等待管理员审核")
     @PreAuthorize("hasAnyRole('ORGANIZER', 'ADMIN')")
+    @OperationLog(action = "ACTIVITY_SUBMIT_REVIEW", targetType = "activity", targetIdParam = "id", description = "提交活动审核")
     @PostMapping("/{id}/submit-review")
     public Result<Void> submitReview(
             @Parameter(description = "活动ID")
@@ -136,6 +167,7 @@ public class ActivityController {
      */
     @Operation(summary = "审核活动", description = "审核员或管理员审核待审核活动，通过后进入报名中，拒绝时必须填写原因")
     @PreAuthorize("hasAnyRole('AUDITOR', 'ADMIN')")
+    @OperationLog(action = "ACTIVITY_REVIEW", targetType = "activity", targetIdParam = "dto.id", description = "审核活动")
     @PostMapping("/review")
     public Result<Void> review(@RequestBody @Valid ActivityReviewDTO dto) {
         log.info("审核活动请求：activityId={}, pass={}", dto.getId(), dto.getPass());
@@ -149,6 +181,7 @@ public class ActivityController {
      */
     @Operation(summary = "下架活动", description = "管理员下架非终态活动，下架后活动不可继续报名")
     @PreAuthorize("hasRole('ADMIN')")
+    @OperationLog(action = "ACTIVITY_OFF_SHELF", targetType = "activity", targetIdParam = "id", description = "下架活动")
     @PostMapping("/{id}/off-shelf")
     public Result<Void> offShelf(
             @Parameter(description = "活动ID")
@@ -172,6 +205,21 @@ public class ActivityController {
         log.info("查询活动列表：pageNo={}, pageSize={}, keyword={}, categoryId={}, status={}",
                 dto.getPageNo(), dto.getPageSize(), dto.getKeyword(), dto.getCategoryId(), dto.getStatus());
         return Result.success(activityService.getActivityPage(dto));
+    }
+
+    /**
+     * 热门活动榜单，公开访问。
+     *
+     * <p>按 Redis 热度分数降序返回活动列表项（默认前 10 个，最多 50 个）。
+     * Redis 不可用时降级为空列表 —— 榜单只是展示数据，不影响活动主业务。</p>
+     */
+    @Operation(summary = "热门活动", description = "公开查询热门活动榜单，按热度降序返回，默认前10个，最多50个")
+    @GetMapping("/hot")
+    public Result<List<ActivityListItemVO>> hot(
+            @Parameter(description = "返回条数，默认10，最大50")
+            @RequestParam(defaultValue = "10") @Min(1) @Max(50) Integer limit) {
+        log.info("查询热门活动榜单：limit={}", limit);
+        return Result.success(activityService.getHotActivities(limit));
     }
 
     /**

@@ -13,6 +13,7 @@ import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.ming.campustrade.common.ResultCode;
 import com.ming.campustrade.common.constant.ActivityStatus;
+import com.ming.campustrade.common.constant.RedisConstants;
 import com.ming.campustrade.common.constant.ReservationStatus;
 import com.ming.campustrade.common.constant.WaitlistStatus;
 import com.ming.campustrade.common.exception.BusinessException;
@@ -27,6 +28,8 @@ import com.ming.campustrade.mapper.ReservationMapper;
 import com.ming.campustrade.mapper.UserMapper;
 import com.ming.campustrade.mapper.WaitingListMapper;
 import com.ming.campustrade.messaging.NotificationEventPublisher;
+import com.ming.campustrade.service.ActivityCacheService;
+import com.ming.campustrade.service.ActivityHotRankService;
 import com.ming.campustrade.service.ReservationService;
 import com.ming.campustrade.service.WaitlistService;
 import com.ming.campustrade.utils.UserHolder;
@@ -96,16 +99,39 @@ public class ReservationServiceImpl implements ReservationService {
      */
     private final NotificationEventPublisher notificationEventPublisher;
 
+    /**
+     * 活动详情缓存组件：预约/取消后清除活动详情缓存（Cache-Aside 的“写后失效”）。
+     *
+     * <p>活动公开详情里有 currentCount（已报名人数），预约或取消都会改变它，
+     * 必须删除 activity:detail:{activityId}，否则用户看到的是过期人数。
+     * Redis 只加速读，MySQL 才是最终依据；evict 内部已吞掉 Redis 异常，
+     * 删缓存失败不影响预约/取消业务。</p>
+     */
+    private final ActivityCacheService activityCacheService;
+
+    /**
+     * 活动热度排行榜组件：预约成功后累计热度（排行榜仅展示，不影响核心业务）。
+     *
+     * <p>排行榜是纯展示数据：热度只用于“哪些活动更热门”的排序展示，
+     * 绝不参与预约名额判断、候补排序或状态流转 —— 那些必须以 MySQL 为准。
+     * Redis 出错由本组件内部降级，不影响预约主流程。</p>
+     */
+    private final ActivityHotRankService activityHotRankService;
+
     public ReservationServiceImpl(ActivityMapper activityMapper, ReservationMapper reservationMapper,
                                   UserMapper userMapper, WaitlistService waitlistService,
                                   WaitingListMapper waitingListMapper,
-                                  NotificationEventPublisher notificationEventPublisher) {
+                                  NotificationEventPublisher notificationEventPublisher,
+                                  ActivityCacheService activityCacheService,
+                                  ActivityHotRankService activityHotRankService) {
         this.activityMapper = activityMapper;
         this.reservationMapper = reservationMapper;
         this.userMapper = userMapper;
         this.waitlistService = waitlistService;
         this.waitingListMapper = waitingListMapper;
         this.notificationEventPublisher = notificationEventPublisher;
+        this.activityCacheService = activityCacheService;
+        this.activityHotRankService = activityHotRankService;
     }
 
     /**
@@ -284,6 +310,24 @@ public class ReservationServiceImpl implements ReservationService {
             }
         });
 
+        // ===== 4.10.5 事务提交后删除活动详情缓存 =====
+        // 预约成功后 currentCount 已 +1（若 4.9 还取消了原候补，waitingListCount 再 -1），
+        // 旧缓存里的数字已过期，必须删除 activity:detail:{activityId}。
+        // 与通知回调分开注册：缓存删除和消息发送是相互独立的辅助能力，
+        // 不放进通知的 try-catch —— evict 内部已吞异常，不会影响预约主流程。
+        // 同一次操作里“预约 +1”和“取消候补 -1”涉及同一个活动，重复删除同一个
+        // Key 也没问题：缓存删除是幂等操作，删不存在的 Key 只是返回 0。
+        evictActivityCacheAfterCommit(activityId);
+
+        // ===== 4.10.6 事务提交后记录活动热度 +10 =====
+        // 预约是用户对活动的真实兴趣行为，成功后给热门排行榜加分；
+        // 与通知、缓存失效一样是独立的后置动作，不放进通知的 try-catch ——
+        // Redis 出错由 ActivityHotRankService 内部降级，绝不影响已提交的预约。
+        // 注意：取消预约不加热度（撤回不是热度行为），自动补位也不加热度
+        // （系统流程不是用户兴趣，否则同一位候补用户会被重复加分）。
+        publishAfterCommit(() -> activityHotRankService.recordHeat(
+                activityId, RedisConstants.ACTIVITY_HOT_RESERVE_SCORE));
+
         // ===== 4.11 日志 =====
         log.info("预约成功：userId={}, activityId={}", userId, activityId);
     }
@@ -329,9 +373,14 @@ public class ReservationServiceImpl implements ReservationService {
             throw new BusinessException(ResultCode.RESERVATION_NOT_FOUND);
         }
 
-        // ===== 2.3 查活动，校验活动还没开始 =====
-        // 活动一旦开始，名额已被占用（现场座位/物料已准备），不能再取消
-        Activity activity = activityMapper.selectById(activityId);
+        // ===== 2.3 加锁查活动，校验活动还没开始 =====
+        // 活动下架也会同时修改活动状态、有效预约和 currentCount。
+        // 这里使用同一把 activity 行锁：
+        // - 若取消预约先拿到锁，会完整执行“预约取消 + 名额 -1”后再让下架继续；
+        // - 若管理员下架先拿到锁，预约会先被标为 EXPIRED，本次取消的条件更新影响 0 行并回滚。
+        // 这样两张表不会留下“活动已下架但预约仍是 CONFIRMED”的不一致数据。
+        // 该方法已有 @Transactional，FOR UPDATE 的锁会一直持有到事务结束。
+        Activity activity = activityMapper.selectByIdForUpdate(activityId);
         if (activity == null) {
             // 不能因为预约记录存在就忽略活动不存在的异常情况。
             // 如果继续执行，后面可能会成功取消预约，但活动名额根本无法释放，造成数据不一致。
@@ -422,6 +471,13 @@ public class ReservationServiceImpl implements ReservationService {
             }
         });
 
+        // ===== 2.7.5 事务提交后删除活动详情缓存 =====
+        // 取消后 currentCount 已 -1；2.6 的补位还会让 currentCount +1、
+        // waitingListCount -1 —— 无论如何缓存中的数字都已过期。
+        // 删 Key 后下一次详情查询会从 MySQL 得到最终的汇总数据。
+        // 同样单独注册回调：缓存删除与消息发送/补位互不干扰。
+        evictActivityCacheAfterCommit(activityId);
+
         // ===== 2.8 日志 =====
         log.info("取消预约成功：userId={}, activityId={}", userId, activityId);
     }
@@ -487,6 +543,23 @@ public class ReservationServiceImpl implements ReservationService {
             // 防御性兜底：调用方没有开启事务时（如单元测试直接调用），直接执行
             task.run();
         }
+    }
+
+    /**
+     * 事务提交后删除活动详情缓存（Cache-Aside 的“写后失效”）。
+     *
+     * <p><b>为什么必须提交后删除？</b><br>
+     * Redis 只加速读，MySQL 事务成功提交后数据才真正变化；
+     * 如果先删缓存、随后事务回滚，等于白白丢了一次有效缓存（无谓的缓存穿透）。
+     * 所以统一复用 {@link #publishAfterCommit}，只有事务真正提交成功才删缓存。</p>
+     *
+     * <p>缓存删除是幂等操作：同一活动的多个变更（如“预约 +1”和“取消原候补 -1”）
+     * 即使重复删除同一个 Key 也没有任何问题，删不存在的 Key 只是返回 0。</p>
+     *
+     * @param activityId 活动 ID
+     */
+    private void evictActivityCacheAfterCommit(Long activityId) {
+        publishAfterCommit(() -> activityCacheService.evict(activityId));
     }
 
     // ==================== 我的预约列表 ====================

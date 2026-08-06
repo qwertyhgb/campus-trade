@@ -132,4 +132,110 @@ public final class RedisConstants {
      * 2. 如果商品后来被创建了，5分钟后缓存过期就能查到
      */
     public static final Long PRODUCT_NULL_TTL = 5L;
+
+    // ==================== 活动缓存 ====================
+
+    /**
+     * 活动缓存边界：
+     * Redis 只用于加速读取活动详情和展示热门排行；MySQL 才是活动、预约和候补数据的最终依据。
+     * Redis 缓存中的 currentCount、候补人数可能短暂旧，但绝不能用于决定“用户能否预约”。
+     * 是否能预约、是否满员、候补顺序、活动状态转换，仍必须走 MySQL 查询与条件更新。
+     *
+     * 缓存失效清单（Cache-Aside 的“写后删缓存”）：
+     * - 活动创建后：通常无需删旧缓存，因为还没有旧 Key。
+     * - 活动编辑、审核、下架、删除后：删除对应活动详情缓存。
+     * - 预约成功、取消预约后：删除对应活动详情缓存。
+     * - 加入候补、取消候补、候补补位后：删除对应活动详情缓存。
+     * - Redis 删除失败：只能记日志，不能让 MySQL 核心事务失败。
+     * 先保证 MySQL 写入成功，再删除缓存；下次读取时自然重建新缓存。
+     */
+
+    /** 活动详情缓存的 Redis Key 前缀，例如：activity:detail:1001 */
+    public static final String ACTIVITY_DETAIL_KEY = "activity:detail:";
+
+    /** 活动详情缓存的基础过期时间（单位：分钟） */
+    public static final Long ACTIVITY_DETAIL_TTL = 30L;
+
+    /** 活动详情缓存的随机过期时间范围，实际 TTL 为 30 + 0~10 分钟 */
+    public static final int ACTIVITY_DETAIL_TTL_RANDOM_RANGE = 10;
+
+    /** 活动不存在时写入的空值标记，用于防止缓存穿透 */
+    public static final String ACTIVITY_NULL_VALUE = "NULL";
+
+    /** 活动空值缓存的过期时间（单位：分钟） */
+    public static final Long ACTIVITY_NULL_TTL = 5L;
+
+    /** Redis ZSet 热门活动排行榜 Key */
+    public static final String ACTIVITY_HOT_RANK_KEY = "activity:rank:hot";
+
+    /**
+     * 热门排行榜默认返回条数。
+     *
+     * <p>调用方未传 limit 或传了非法值（小于 1）时，排行榜默认返回前 10 个活动 ID。</p>
+     */
+    public static final int ACTIVITY_HOT_RANK_DEFAULT_LIMIT = 10;
+
+    /**
+     * 热门排行榜单次查询的最大条数上限。
+     *
+     * <p>防止调用方传入超大 limit（如 100000）导致 ZREVRANGE 一次取出海量成员，
+     * 占用 Redis 内存与网络带宽。超过上限时按上限截断。</p>
+     */
+    public static final int ACTIVITY_HOT_RANK_MAX_LIMIT = 50;
+
+    /** 单次预约成功累计的热度分数（ZSet score 增量） */
+    public static final double ACTIVITY_HOT_RESERVE_SCORE = 10.0;
+
+    /** 单次加入候补成功累计的热度分数（ZSet score 增量） */
+    public static final double ACTIVITY_HOT_WAITLIST_SCORE = 5.0;
+
+    // ==================== 幂等 Token ====================
+
+    /**
+     * 幂等 Token 的 Redis Key 前缀。
+     *
+     * <p>完整 Key 格式：idempotency:token:{userId}:{scene}:{token}
+     * 例如：idempotency:token:1001:activity:create:3f2a9c8e-...</p>
+     *
+     * <p><b>为什么 Key 里要带 userId 和 scene？</b><br>
+     * ① 带 userId：A 用户领取的 Token 不能被 B 用户使用（防串用）；<br>
+     * ② 带 scene：同一用户在不同业务场景（创建活动/预约/候补）各有独立 Token，互不干扰。</p>
+     */
+    public static final String IDEMPOTENCY_TOKEN_KEY = "idempotency:token:";
+
+    /**
+     * 幂等 Token 的过期时间（单位：分钟）。
+     *
+     * <p>5 分钟：足够前端完成一次表单填写与提交；超时后 Token 自动失效，
+     * 前端需要重新领取 —— 过期失效是幂等保护的兜底，防止 Token 永久占用。</p>
+     */
+    public static final Long IDEMPOTENCY_TOKEN_TTL = 5L;
+
+    // ==================== 限流 ====================
+
+    /**
+     * 限流计数器的 Redis Key 前缀。
+     *
+     * <p>完整 Key 格式：rate:limit:{scene}:{clientKey}
+     * 例如：rate:limit:login:192.168.1.100、rate:limit:activity:query:192.168.1.100</p>
+     *
+     * <p><b>为什么 Key 里要带场景和客户端标识？</b><br>
+     * ① 带 scene：登录限流和活动查询限流互不影响（各计各的数）；<br>
+     * ② 带 clientKey：不同 IP 各自计数，一个人被限流不会连累其他人。</p>
+     */
+    public static final String RATE_LIMIT_KEY = "rate:limit:";
+
+    /**
+     * 限流时间窗口长度（单位：秒）。
+     *
+     * <p>固定时间窗口：Key 第一次计数时设置 60 秒过期，60 秒后 Key 自动消失、
+     * 计数归零 —— 即“每分钟最多 N 次”。</p>
+     */
+    public static final Long RATE_LIMIT_WINDOW_SECONDS = 60L;
+
+    /** 登录接口限流上限：每 IP 每分钟最多 10 次（防暴力破解/撞库） */
+    public static final int RATE_LIMIT_LOGIN_MAX = 10;
+
+    /** 活动公开查询限流上限：每 IP 每分钟最多 60 次（防爬虫高频抓取） */
+    public static final int RATE_LIMIT_QUERY_MAX = 60;
 }

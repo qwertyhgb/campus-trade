@@ -54,7 +54,7 @@ public class ActivityDetailVO {
     /** 当前已预约人数。 */
     private Integer currentCount;
 
-    /** 候补人数；候补模块完成前由活动服务暂时填充为 0。 */
+    /** 当前活动处于 WAITING 状态且 activeMark 为 1 的有效候补人数。 */
     private Integer waitingListCount;
 
     /** 活动状态，见 ActivityStatus：0草稿 1待审核 2审核拒绝 3报名中 4报名结束 5进行中 6已结束 7已下架。 */

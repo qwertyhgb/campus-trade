@@ -155,7 +155,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
 
     /**
      * 卖家确认订单 - 订单交易流程的第二步
-     * 
+     * <p>
      * 流程说明：
      * 1. 查询订单是否存在
      * 2. 验证当前用户是否是卖家（权限检查）

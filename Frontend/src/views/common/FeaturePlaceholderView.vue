@@ -1,0 +1,3 @@
+<script setup lang="ts">import { useRoute } from 'vue-router'; const route = useRoute(); const title = (route.meta.label as string | undefined) || '功能模块'</script>
+<template><section class="placeholder section-card"><span>FRONTEND SCAFFOLD</span><h1>{{ title }}</h1><p>页面路由、登录保护和基础框架已经建立。请按照 `docs/frontend_plan.md` 的阶段顺序接入对应 API。</p></section></template>
+<style scoped>.placeholder { display: grid; min-height: 360px; place-content: center; gap: 12px; padding: 32px; text-align: center; }.placeholder span { color: #2563eb; font-size: 12px; font-weight: 700; letter-spacing: .12em; }.placeholder h1, .placeholder p { margin: 0; }.placeholder p { max-width: 520px; color: #64748b; line-height: 1.8; }</style>

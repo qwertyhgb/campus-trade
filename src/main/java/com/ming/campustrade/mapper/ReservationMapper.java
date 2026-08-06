@@ -5,6 +5,7 @@ import java.util.List;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.ming.campustrade.entity.Reservation;
@@ -36,6 +37,23 @@ public interface ReservationMapper extends BaseMapper<Reservation> {
             + "LIMIT 1")
     Reservation selectActiveReservation(@Param("userId") Long userId,
                                         @Param("activityId") Long activityId);
+
+    /**
+     * 活动被管理员下架后，批量使仍有效的正式预约失效。
+     *
+     * <p>这里同时限制 {@code status=0 AND active_mark=1}，因此只会处理仍占用名额的预约；
+     * 已取消、已补位后的历史记录不会被重复改写。即使同一操作因重试再次执行，
+     * 第二次也只会影响 0 行，这就是批量更新具备幂等性的原因。</p>
+     *
+     * @param activityId 被下架的活动 ID
+     * @return 实际失效的预约数量
+     */
+    @Update("UPDATE reservation "
+            + "SET status = 2, active_mark = NULL, cancel_time = NOW() "
+            + "WHERE activity_id = #{activityId} "
+            + "AND status = 0 "
+            + "AND active_mark = 1")
+    int expireActiveReservationsByActivityId(@Param("activityId") Long activityId);
 
     /**
      * 查询某活动所有有效预约的用户列表（活动即将开始通知时使用）。

@@ -84,6 +84,18 @@ public interface ActivityService extends IService<Activity> {
     ActivityDetailVO getActivityDetail(Long id);
 
     /**
+     * 查询热门活动榜单，按 Redis 热度分数降序返回。
+     *
+     * <p>Redis ZSet 只提供“热度排序的 ID”；标题、封面、人数等展示数据仍从 MySQL 批量读取。
+     * 只返回公开状态（报名中/报名结束/进行中/已结束）的活动 ——
+     * 已删除、已下架或内部状态的活动即使残留在排行榜，数据库过滤后也不会展示。</p>
+     *
+     * @param limit 期望返回条数（null 或非法值由实现层兜底：小于 1 用默认 10，最大 50）
+     * @return 按热度降序的活动列表项；排行榜为空或 Redis 不可用时返回空列表
+     */
+    List<ActivityListItemVO> getHotActivities(Integer limit);
+
+    /**
      * 查询当前登录用户（组织者）创建的全部活动列表，按创建时间倒序。
      *
      * @return 当前用户的活动列表

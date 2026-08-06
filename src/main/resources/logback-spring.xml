@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  logback 日志配置（阶段 8：日志与审计）
+
+  设计要点：
+  1. 日志格式中输出 [traceId=xxx]：由 TraceIdFilter 写入 MDC，
+     同一请求的所有日志（限流/认证/业务/SQL）都带同一个追踪 ID，
+     排查问题时按 traceId 搜索即可还原整条调用链。
+  2. 控制台 + 滚动文件双输出：控制台方便开发调试，文件便于线上排查；
+     文件按天滚动、保留 30 天，防止磁盘被日志占满。
+  3. 级别约定（合理的日志级别）：
+     - ERROR：系统异常（数据库/Redis 故障、未捕获异常）——必须立即关注
+     - WARN ：可恢复的异常（Redis 降级、限流触发、审计写库失败）——需要关注
+     - INFO ：关键业务节点（创建/审核/预约/候补/下架）——正常审计依据
+     - DEBUG：SQL 与调试细节（默认关闭，排查问题时临时开启）
+  4. 敏感信息红线：密码、完整 Token、手机号、身份证号等
+     禁止出现在任何日志（包括 INFO/DEBUG 级别）——日志里只打 ID 与脱敏摘要。
+-->
+<configuration>
+    <!-- 日志格式：时间 [线程] 级别 Logger - [traceId] 消息 + 换行 -->
+    <property name="LOG_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{40} - [traceId=%X{traceId:-}] %msg%n"/>
+
+    <!-- 日志目录（与 .gitignore 中的 logs/ 保持一致，不提交到仓库） -->
+    <property name="LOG_DIR" value="logs/campus-trade"/>
+
+    <!-- 控制台输出：开发时直接看 -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 滚动文件输出：按天滚动，保留 30 天 -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/application.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <!-- 每天一个文件：application.2026-08-05.log -->
+            <fileNamePattern>${LOG_DIR}/application.%d{yyyy-MM-dd}.log</fileNamePattern>
+            <maxHistory>30</maxHistory>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 根日志级别：INFO（ERROR/WARN/INFO 都输出，DEBUG 默认关闭） -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
+    </root>
+</configuration>

@@ -1,6 +1,7 @@
 package com.ming.campustrade.service.impl;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -9,11 +10,13 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.ming.campustrade.common.ResultCode;
 import com.ming.campustrade.common.constant.ActivityStatus;
+import com.ming.campustrade.common.constant.ReservationStatus;
 import com.ming.campustrade.common.exception.BusinessException;
 import com.ming.campustrade.dto.ActivityCreateDTO;
 import com.ming.campustrade.dto.ActivityQueryDTO;
@@ -24,14 +27,18 @@ import com.ming.campustrade.entity.ActivityCategory;
 import com.ming.campustrade.entity.User;
 import com.ming.campustrade.event.ActivityReviewedEvent;
 import com.ming.campustrade.mapper.ActivityMapper;
+import com.ming.campustrade.mapper.ReservationMapper;
 import com.ming.campustrade.mapper.UserMapper;
 import com.ming.campustrade.mapper.WaitingListMapper;
 import com.ming.campustrade.messaging.NotificationEventPublisher;
+import com.ming.campustrade.service.ActivityCacheService;
 import com.ming.campustrade.service.ActivityCategoryService;
+import com.ming.campustrade.service.ActivityHotRankService;
 import com.ming.campustrade.service.ActivityService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.ActivityDetailVO;
 import com.ming.campustrade.vo.ActivityListItemVO;
+import com.ming.campustrade.vo.ActivityPublicDetailVO;
 import com.ming.campustrade.vo.UserVO;
 
 import lombok.extern.slf4j.Slf4j;
@@ -83,6 +90,26 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
     );
 
     /**
+     * 活动详情缓存组件：负责删除活动详情缓存（Cache-Aside 的“写后失效”）以及读取/回填。
+     *
+     * <p>活动本身的内容或状态一旦变化，Redis 里的旧详情必须删除，
+     * 否则用户会持续看到过期数据。本字段只负责缓存的读写删，不改变任何活动数据库业务；
+     * evict 内部已吞掉 Redis 异常，删除失败不会影响活动事务。</p>
+     */
+    private final ActivityCacheService activityCacheService;
+
+    /**
+     * 活动 Mapper：详情查询时直接按主键查库。
+     *
+     * <p>为什么详情查询不复用 ServiceImpl 自带的 getById / 私有 getActivity？<br>
+     * 因为缓存流程需要区分三种情况：缓存命中（直接返回）、空值缓存命中（活动确实不存在）、
+     * 数据库查不到（写入空值缓存防穿透）。getActivity 是“查不到立即抛异常”的封装，
+     * 无法区分“查不到”这一事实，所以详情查询直接走 Mapper 原生 selectById，
+     * 由本方法自己决定查不到时如何处理。</p>
+     */
+    private final ActivityMapper activityMapper;
+
+    /**
      * 活动分类 Service：用于校验分类是否存在（创建/编辑）以及批量查分类名（列表/详情填充）。
      * 通过构造器注入，保证依赖不可变（final）。
      */
@@ -102,20 +129,45 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
     private final WaitingListMapper waitingListMapper;
 
     /**
+     * 下架活动时需要同步使有效预约失效。
+     *
+     * <p>预约不是逻辑删除，而是保留状态历史；因此这里通过 Mapper 批量改为
+     * {@code EXPIRED}，并释放 {@code activeMark}，而不是直接删除预约行。</p>
+     */
+    private final ReservationMapper reservationMapper;
+
+    /**
      * 通知事件发布器：审核完成后，在事务提交后发送 RabbitMQ 事件。
      *
      * <p>只依赖 RabbitTemplate，不会与业务 Service 形成循环依赖。</p>
      */
     private final NotificationEventPublisher notificationEventPublisher;
 
-    public ActivityServiceImpl(ActivityCategoryService activityCategoryService,
+    /**
+     * 活动热度排行榜组件：活动删除/下架后清除排行榜残留（排行榜仅展示，不影响核心业务）。
+     *
+     * <p>排行榜是纯展示数据：热度只用于“哪些活动更热门”的排序展示，
+     * 绝不参与名额判断、状态流转等任何核心业务 —— 那些必须以 MySQL 为准。
+     * removeActivity 内部已吞掉 Redis 异常，清理失败不影响活动删除/下架。</p>
+     */
+    private final ActivityHotRankService activityHotRankService;
+
+    public ActivityServiceImpl(ActivityCacheService activityCacheService,
+                               ActivityMapper activityMapper,
+                               ActivityCategoryService activityCategoryService,
                                UserMapper userMapper,
                                WaitingListMapper waitingListMapper,
-                               NotificationEventPublisher notificationEventPublisher) {
+                               ReservationMapper reservationMapper,
+                               NotificationEventPublisher notificationEventPublisher,
+                               ActivityHotRankService activityHotRankService) {
+        this.activityCacheService = activityCacheService;
+        this.activityMapper = activityMapper;
         this.activityCategoryService = activityCategoryService;
         this.userMapper = userMapper;
         this.waitingListMapper = waitingListMapper;
+        this.reservationMapper = reservationMapper;
         this.notificationEventPublisher = notificationEventPublisher;
+        this.activityHotRankService = activityHotRankService;
     }
 
     // ==================== 创建活动 ====================
@@ -280,6 +332,8 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
             throw new BusinessException(ResultCode.INTERNAL_ERROR, "活动修改失败");
         }
         log.info("修改活动成功：activityId={}, operatorId={}", activity.getId(), currentUser.getId());
+        // 活动内容已变化，事务提交后删除旧详情缓存，避免用户继续看到编辑前的详情
+        evictActivityCacheAfterCommit(activity.getId());
     }
 
     // ==================== 删除活动 ====================
@@ -312,6 +366,10 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
             throw new BusinessException(ResultCode.INTERNAL_ERROR, "活动删除失败");
         }
         log.info("删除活动成功：activityId={}, operatorId={}", id, currentUser.getId());
+        // 活动已逻辑删除，事务提交后删除旧详情缓存，避免已删除活动仍展示在详情页
+        evictActivityCacheAfterCommit(id);
+        // 活动已删除，事务提交后清除排行榜残留（已删除活动不应继续出现在热门榜）
+        publishAfterCommit(() -> activityHotRankService.removeActivity(id));
     }
 
     // ==================== 提交审核 ====================
@@ -341,8 +399,14 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
         // 1. 身份校验
         UserVO currentUser = requireCurrentUser();
 
-        // 2. 查活动
-        Activity activity = getActivity(id);
+        // 2. 用 FOR UPDATE 读取并锁住活动行。
+        //    下架、预约和取消预约都会修改 activity 表；先加行锁可让它们在同一活动上串行执行，
+        //    避免出现“下架后又成功预约”或“下架漏掉并发取消中的预约”等中间状态。
+        //    该查询必须位于 @Transactional 方法内，锁会在本事务提交/回滚时自动释放。
+        Activity activity = activityMapper.selectByIdForUpdate(id);
+        if (activity == null) {
+            throw new BusinessException(ResultCode.ACTIVITY_NOT_FOUND);
+        }
 
         // 3. 归属校验：只允许组织者本人（管理员不能代提交，见方法注释）
         checkOwner(activity, currentUser);
@@ -366,6 +430,8 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
             throw new BusinessException(ResultCode.INTERNAL_ERROR, "提交审核失败");
         }
         log.info("提交活动审核成功：activityId={}, organizerId={}", id, currentUser.getId());
+        // 活动状态已变化，事务提交后删除旧详情缓存（若之前存在公开缓存则一并清除）
+        evictActivityCacheAfterCommit(id);
     }
 
     // ==================== 管理员审核 ====================
@@ -447,6 +513,12 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
             }
         });
 
+        // 11. 事务提交后删除活动详情缓存（单独注册一个提交后回调）
+        //     审核通过/拒绝都会改变活动状态和审核信息，旧缓存必须失效；
+        //     不写进上面通知的 try-catch：Redis 删除与消息发送互不干扰，
+        //     evict 内部已吞掉异常，删除失败也不会影响审核事务
+        evictActivityCacheAfterCommit(dto.getId());
+
         log.info("审核活动成功：activityId={}, reviewerId={}, pass={}",
                 dto.getId(), currentUser.getId(), dto.getPass());
     }
@@ -471,6 +543,24 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
             // 防御性兜底：调用方没有开启事务时直接执行
             task.run();
         }
+    }
+
+    /**
+     * 活动写操作成功后，在事务提交后删除该活动的详情缓存（Cache-Aside 的“写后失效”）。
+     *
+     * <p><b>为什么必须提交后删除？</b><br>
+     * 1. 如果先删缓存、随后数据库事务回滚，缓存没了虽然不影响正确性，
+     *    但相当于白白丢弃了一次有效缓存，下一次访问要多查一次 MySQL（不必要的缓存穿透）；
+     * 2. 更关键的是，数据库没有成功就不应该对缓存做“数据已变化”的操作。
+     * 所以统一复用 {@link #publishAfterCommit}，只有事务真正提交后才删缓存。</p>
+     *
+     * <p>ActivityCacheService.evict() 内部已记录日志并吞掉 Redis 异常，
+     * 这里不需要额外 try-catch —— Redis 删除失败绝不能影响活动事务本身。</p>
+     *
+     * @param activityId 活动 ID
+     */
+    private void evictActivityCacheAfterCommit(Long activityId) {
+        publishAfterCommit(() -> activityCacheService.evict(activityId));
     }
 
     // ==================== 管理员下架 ====================
@@ -507,21 +597,39 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
             throw new BusinessException(ResultCode.ACTIVITY_STATUS_ERROR);
         }
 
-        // 4. 更新状态并写库
-        activity.setStatus(to);
-        if (!this.updateById(activity)) {
+        // 4. 条件更新活动状态，并将已占用人数归零。
+        //    虽然第 2 步已经持有行锁，仍在 WHERE 中带上原状态作为最后一道保护：
+        //    只有状态仍是刚才读到的 from 时才允许下架。下架后所有有效预约都会在下面失效，
+        //    所以 currentCount 也必须归零，保证 activity 表的汇总值和预约表一致。
+        LambdaUpdateWrapper<Activity> offShelfWrapper = new LambdaUpdateWrapper<>();
+        offShelfWrapper.eq(Activity::getId, id)
+                .eq(Activity::getStatus, from)
+                .set(Activity::getStatus, to)
+                .set(Activity::getCurrentCount, 0);
+        if (activityMapper.update(null, offShelfWrapper) != 1) {
             throw new BusinessException(ResultCode.INTERNAL_ERROR, "活动下架失败");
         }
 
-        // 活动状态和候补状态必须一起成功或一起失败。
-        // 如果只更新 activity，候补用户在短时间内仍会看到 WAITING，
-        // 甚至可能在补位流程中被错误处理。Mapper 条件只更新 WAITING + active_mark=1，
-        // 已补位/已取消/已失效的历史记录会原样保留。
+        // 5. 活动、有效预约、候补状态必须一起成功或一起失败。
+        //    预约的 EXPIRED 状态用于表达“不是用户主动取消，而是活动下架导致失效”。
+        //    active_mark 置为 NULL 后，唯一索引不会再把这条历史失效记录当成“有效预约”；
+        //    同时失效记录仍保留在库中，用户可以查看完整历史。
+        int expiredReservationRows = reservationMapper.expireActiveReservationsByActivityId(id);
+        if (expiredReservationRows > 0) {
+            log.info("活动下架后预约自动失效：activityId={}, 影响 {} 条，失效状态={}",
+                    id, expiredReservationRows, ReservationStatus.EXPIRED);
+        }
+
+        // 候补记录同理：只更新 WAITING + active_mark=1，已补位/已取消/已失效的历史保持不变。
         int expiredRows = waitingListMapper.expireActiveWaitingByActivityId(id);
         if (expiredRows > 0) {
             log.info("活动下架后候补自动失效：activityId={}, 影响 {} 条", id, expiredRows);
         }
         log.info("下架活动成功：activityId={}, operatorId={}", id, currentUser.getId());
+        // 活动状态已变为终态，事务提交后删除旧详情缓存，避免已下架活动仍展示在详情页
+        evictActivityCacheAfterCommit(id);
+        // 活动已下架，事务提交后清除排行榜残留（下架活动不应继续出现在热门榜）
+        publishAfterCommit(() -> activityHotRankService.removeActivity(id));
     }
 
     // ==================== 列表/详情/我的活动 ====================
@@ -615,28 +723,96 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
      * 审核留痕只返回给活动组织者和管理员，避免公开接口泄露审核人员信息及内部处理原因。
      * 分类名和组织者昵称各发一次单条查询即可（详情页只有一条记录，无需批量）。</p>
      *
-     * <p><b>候补人数</b>：当前阶段候补模块（WaitingList）尚未实现，这里先留 TODO，
-     * 待阶段 5 实现候补队列后再补充查询逻辑。</p>
+     * <p><b>Cache-Aside 读流程（先缓存、后数据库）：</b></p>
+     * <ol>
+     *   <li><b>读公开缓存</b>：缓存命中且当前用户不需要审核信息 → 直接返回（零 SQL）</li>
+     *   <li><b>查空值缓存</b>：防缓存穿透 —— 活动此前被确认不存在时不再查 MySQL</li>
+     *   <li><b>查 MySQL</b>：查不到 → 写空值缓存；查到 → 权限校验 + 组装 + 回填缓存</li>
+     * </ol>
+     *
+     * <p><b>为什么组织者/管理员必须绕过公开缓存回查 MySQL？</b><br>
+     * 公开缓存（ActivityPublicDetailVO）不含审核留痕，是所有访问者共用的安全数据。
+     * 如果组织者/管理员也直接返回缓存，他们会丢失 reviewerId / reviewTime / rejectReason；
+     * 所以这两类人即使缓存命中，也必须继续查 MySQL，由 buildActivityDetail 重新组装
+     * 携带审核信息的完整详情。</p>
      *
      * @param id 活动 ID
      * @return 活动详情视图对象
-     * @throws BusinessException 活动不存在
+     * @throws BusinessException 活动不存在（含空值缓存命中）
      */
     @Override
     public ActivityDetailVO getActivityDetail(Long id) {
-        // 1. 查活动，不存在直接抛异常（复用已有的 getActivity 私有方法）
-        Activity activity = getActivity(id);
+        // 0. 获取当前登录用户（匿名访问时为 null，不影响后续判断）
+        UserVO currentUser = UserHolder.getUserVO();
 
-        // 2. 权限边界：匿名用户只能看公开状态；组织者本人和管理员可以查看自己的内部状态。
+        // 1. 先读公开详情缓存（Redis 只加速读，MySQL 才是最终依据）
+        ActivityPublicDetailVO cachedDetail = activityCacheService.getCachedDetail(id);
+        if (cachedDetail != null) {
+            // 缓存命中：
+            // - 普通访问者（非管理员、非组织者）直接复用缓存，省掉全部 SQL；
+            // - 管理员和活动组织者即使缓存命中也要绕过（见 mustBypassPublicCache），
+            //   继续走下面的 MySQL 查询，因为他们需要看到审核留痕。
+            if (!mustBypassPublicCache(currentUser, cachedDetail)) {
+                return fromPublicCacheDetail(cachedDetail);
+            }
+        } else if (activityCacheService.isNullCached(id)) {
+            // 2. 详情缓存未命中时检查空值缓存：之前已确认过“活动不存在”，
+            //    直接返回不存在，不再查 MySQL —— 这就是防缓存穿透的关键。
+            throw new BusinessException(ResultCode.ACTIVITY_NOT_FOUND);
+        }
+
+        // 3. 查 MySQL（不复用 getActivity：这里需要区分“查不到”并自行处理）
+        Activity activity = activityMapper.selectById(id);
+        if (activity == null) {
+            // 活动确实不存在：写入空值缓存（短 TTL），
+            // 防止恶意/误请求反复穿透到数据库。
+            activityCacheService.cacheNull(id);
+            throw new BusinessException(ResultCode.ACTIVITY_NOT_FOUND);
+        }
+
+        // 4. 权限边界：匿名用户只能看公开状态；组织者本人和管理员可以查看自己的内部状态。
         //    对非公开活动统一返回“活动不存在”，而不是提示“你没有权限”，
         //    这样可以避免别人通过遍历 ID 探测到草稿或待审核活动的存在。
-        UserVO currentUser = UserHolder.getUserVO();
+        //    注意：这里绝不能写空值缓存 —— 活动真实存在，只是当前用户无权查看，
+        //    写空值缓存会导致其他有权用户也看到“不存在”。
         boolean canViewPrivate = canViewPrivateActivity(activity, currentUser);
         if (!isPublicActivityStatus(activity.getStatus()) && !canViewPrivate) {
             throw new BusinessException(ResultCode.ACTIVITY_NOT_FOUND);
         }
 
-        // 3. 组装详情 VO：逐字段拷贝（避免 BeanUtils 反射，类型更安全、可读性更好）
+        // 5. 组装详情 VO：能否携带审核信息由权限判断结果决定（组织者本人/管理员才有审核留痕）
+        ActivityDetailVO detail = buildActivityDetail(activity, canViewPrivate);
+
+        // 6. 回填公开缓存：只缓存公开状态的活动。
+        //    toPublicCacheDetail 只复制公开字段，审核信息永远不会进入 Redis；
+        //    草稿/待审核等内部状态的活动即使组织者本人查看，也不回填，
+        //    否则缓存被普通用户命中就会泄露内部数据。
+        if (isPublicActivityStatus(activity.getStatus())) {
+            activityCacheService.cacheDetail(id, toPublicCacheDetail(detail));
+        }
+
+        return detail;
+    }
+
+    /**
+     * 组装活动详情 VO（按访问者身份决定是否携带审核信息）。
+     *
+     * <p>把“查活动 + 判权限”（getActivityDetail）和“组装 VO”（本方法）拆开，
+     * 是因为下一步接入 Redis 缓存时需要复用：缓存未命中时仍要完整查库组装，
+     * 而是否带审核信息只取决于调用方传入的 includeReviewInfo，组装逻辑本身不需要变。</p>
+     *
+     * <p><b>为什么审核信息要按 includeReviewInfo 条件返回？</b><br>
+     * reviewerId / reviewTime / rejectReason 是审核过程的内部留痕：
+     * 组织者本人需要看到“谁在什么时候驳回了、原因是什么”，便于修改后重新提交；
+     * 普通用户和匿名访客则不应看到审核过程，否则等于泄露了审核员的身份。
+     * 所以这三个字段是否填充，由调用方根据权限判断结果决定。</p>
+     *
+     * @param activity          活动实体（已确认存在且允许访问）
+     * @param includeReviewInfo true=填充审核信息（组织者本人/管理员）；false=不填充（公开访问）
+     * @return 活动详情 VO
+     */
+    private ActivityDetailVO buildActivityDetail(Activity activity, boolean includeReviewInfo) {
+        // 1. 复制活动基础字段：逐字段拷贝（避免 BeanUtils 反射，类型更安全、可读性更好）
         ActivityDetailVO vo = new ActivityDetailVO();
         vo.setId(activity.getId());
         vo.setTitle(activity.getTitle());
@@ -650,11 +826,12 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
         vo.setEnrollEndTime(activity.getEnrollEndTime());
         vo.setMaxCount(activity.getMaxCount());
         vo.setCurrentCount(activity.getCurrentCount());
-        // WaitingList 尚未实现，先返回稳定的 0；阶段 5 再替换为真实统计值。
-        vo.setWaitingListCount(0);
+        // 候补人数是展示数据：只统计当前 WAITING 且 active_mark=1 的有效候补。
+        Integer waitingListCount = waitingListMapper.countActiveWaitingByActivityId(activity.getId());
+        vo.setWaitingListCount(waitingListCount == null ? 0 : waitingListCount);
         vo.setStatus(activity.getStatus());
         vo.setOrganizerId(activity.getOrganizerId());
-        if (canViewPrivate) {
+        if (includeReviewInfo) {
             // 审核人、审核时间、驳回原因是内部审核信息，只对组织者本人/管理员返回。
             vo.setReviewerId(activity.getReviewerId());
             vo.setReviewTime(activity.getReviewTime());
@@ -662,20 +839,95 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
         }
         vo.setCreateTime(activity.getCreateTime());
 
-        // 4. 填充分类名：单条查询（详情页只有一条记录）
+        // 2. 填充分类名：单条查询（详情页只有一条记录）
         if (activity.getCategoryId() != null) {
             ActivityCategory category = activityCategoryService.getById(activity.getCategoryId());
             vo.setCategoryName(category == null ? null : category.getName());
         }
 
-        // 5. 填充组织者昵称：单条查询
+        // 3. 填充组织者昵称：单条查询
         if (activity.getOrganizerId() != null) {
             User organizer = userMapper.selectById(activity.getOrganizerId());
             vo.setOrganizerNickname(organizer == null ? null : organizer.getNickname());
         }
 
-        // TODO 阶段 5：候补队列实现后，补充查询候补人数并填充到 VO。
         return vo;
+    }
+
+    /**
+     * 完整详情 → 公开缓存详情（只复制公开字段）。
+     *
+     * <p><b>为什么必须逐字段复制而不是复用同一个对象？</b><br>
+     * ActivityDetailVO 是“按访问者身份组装”的接口返回对象，可能携带审核信息；
+     * ActivityPublicDetailVO 是所有访问者共用的 Redis 数据对象。
+     * 两者语义不同，即使字段看起来大部分相同也不能混用：
+     * 即使传入的 detail 是组织者/管理员看到的完整版本，也绝不能把
+     * reviewerId / reviewTime / rejectReason 带进缓存 ——
+     * 否则匿名用户通过详情接口就能看到审核人的身份和驳回原因，属于信息泄露。
+     * 这里只复制公开字段，从代码上杜绝审核信息进入缓存的可能。</p>
+     *
+     * @param detail 完整详情 VO（可能是带审核信息的内部版本）
+     * @return 公开缓存详情 VO（不含任何审核字段）
+     */
+    private ActivityPublicDetailVO toPublicCacheDetail(ActivityDetailVO detail) {
+        ActivityPublicDetailVO cached = new ActivityPublicDetailVO();
+        cached.setId(detail.getId());
+        cached.setTitle(detail.getTitle());
+        cached.setDescription(detail.getDescription());
+        cached.setLocation(detail.getLocation());
+        cached.setCoverImage(detail.getCoverImage());
+        cached.setCategoryId(detail.getCategoryId());
+        cached.setCategoryName(detail.getCategoryName());
+        cached.setStartTime(detail.getStartTime());
+        cached.setEndTime(detail.getEndTime());
+        cached.setEnrollStartTime(detail.getEnrollStartTime());
+        cached.setEnrollEndTime(detail.getEnrollEndTime());
+        cached.setMaxCount(detail.getMaxCount());
+        cached.setCurrentCount(detail.getCurrentCount());
+        cached.setWaitingListCount(detail.getWaitingListCount());
+        cached.setStatus(detail.getStatus());
+        cached.setOrganizerId(detail.getOrganizerId());
+        cached.setOrganizerNickname(detail.getOrganizerNickname());
+        cached.setCreateTime(detail.getCreateTime());
+        // 注意：reviewerId / reviewTime / rejectReason 一律不复制，参见方法注释
+        return cached;
+    }
+
+    /**
+     * 公开缓存详情 → 接口详情（缓存命中时使用）。
+     *
+     * <p><b>为什么审核字段保持 null？</b><br>
+     * 缓存命中的详情来自 Redis，是面向所有访问者的公开版本，本身就不含审核信息，
+     * 不能凭缓存内容推断任何审核结论。所以这里只复制公开字段，
+     * 审核字段（reviewerId / reviewTime / rejectReason）不设置、保持 null。
+     * 组织者/管理员查看自己的活动时，缓存未命中仍会走
+     * {@link #buildActivityDetail buildActivityDetail(activity, true)} 完整组装，
+     * 审核信息不会因此缺失。</p>
+     *
+     * @param cachedDetail 公开缓存详情 VO
+     * @return 接口详情 VO（审核字段为 null）
+     */
+    private ActivityDetailVO fromPublicCacheDetail(ActivityPublicDetailVO cachedDetail) {
+        ActivityDetailVO detail = new ActivityDetailVO();
+        detail.setId(cachedDetail.getId());
+        detail.setTitle(cachedDetail.getTitle());
+        detail.setDescription(cachedDetail.getDescription());
+        detail.setLocation(cachedDetail.getLocation());
+        detail.setCoverImage(cachedDetail.getCoverImage());
+        detail.setCategoryId(cachedDetail.getCategoryId());
+        detail.setCategoryName(cachedDetail.getCategoryName());
+        detail.setStartTime(cachedDetail.getStartTime());
+        detail.setEndTime(cachedDetail.getEndTime());
+        detail.setEnrollStartTime(cachedDetail.getEnrollStartTime());
+        detail.setEnrollEndTime(cachedDetail.getEnrollEndTime());
+        detail.setMaxCount(cachedDetail.getMaxCount());
+        detail.setCurrentCount(cachedDetail.getCurrentCount());
+        detail.setWaitingListCount(cachedDetail.getWaitingListCount());
+        detail.setStatus(cachedDetail.getStatus());
+        detail.setOrganizerId(cachedDetail.getOrganizerId());
+        detail.setOrganizerNickname(cachedDetail.getOrganizerNickname());
+        detail.setCreateTime(cachedDetail.getCreateTime());
+        return detail;
     }
 
     /**
@@ -704,6 +956,84 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
 
         // 4. 转换为 VO 列表
         return activities.stream()
+                .map(activity -> convertToActivityVO(activity, categoryNameMap, organizerNicknameMap))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 查询热门活动榜单，按 Redis 热度分数降序返回。
+     *
+     * <p><b>Redis 和 MySQL 各司其职：</b><br>
+     * Redis ZSet 只提供“热度排序的 ID”（谁热门、排第几）；
+     * 标题、封面、人数等展示数据仍然从 MySQL 批量读取（数据源头）。
+     * 两者组合：Redis 定顺序，MySQL 出内容。</p>
+     *
+     * <p><b>为什么不能用数据库查询结果的顺序？</b><br>
+     * MySQL 的 IN 查询结果<b>没有顺序保证</b>（返回顺序由执行计划决定），
+     * 直接使用会丢失热度排行。正确做法：按 Redis 返回的 ID 顺序遍历，
+     * 从 Map 中 O(1) 取活动组装 —— 顺序永远以 Redis 榜单为准。</p>
+     *
+     * <p><b>数据库过滤是最后防线：</b><br>
+     * 即使 Redis 残留了已删除/已下架/内部状态的活动，这里也会过滤掉，
+     * 绝不把不可展示的活动返回给用户；同时顺手清理排行榜残留（读取时自愈），
+     * Redis 删除失败也不影响本次返回结果。</p>
+     *
+     * @param limit 期望返回条数（null 或非法值由 ActivityHotRankService 兜底）
+     * @return 按热度降序的活动列表项；排行榜为空或 Redis 不可用时返回空列表
+     */
+    @Override
+    public List<ActivityListItemVO> getHotActivities(Integer limit) {
+        // 1. 从 Redis ZSet 获取热度排序的活动 ID（按分数降序，已做 limit 保护）
+        //    Redis 不可用时 ActivityHotRankService 内部降级返回空列表，
+        //    本接口也就降级为“暂无热门榜”，不影响活动主业务。
+        List<Long> hotIds = activityHotRankService.getHotActivityIds(limit);
+        if (hotIds.isEmpty()) {
+            return List.of();
+        }
+
+        // 2. 一次批量查库（selectByIds 拼成 WHERE id IN (...)，一条 SQL），
+        //    禁止对每个 ID 单独 selectById —— 那是典型的 N+1 查询。
+        List<Activity> activities = activityMapper.selectByIds(hotIds);
+        if (activities.isEmpty()) {
+            return List.of();
+        }
+
+        // 3. 建立 activityId → Activity 的 Map：后面按热度顺序遍历时 O(1) 查找
+        Map<Long, Activity> activityMap = new HashMap<>();
+        for (Activity activity : activities) {
+            activityMap.put(activity.getId(), activity);
+        }
+
+        // 4. 按 Redis 热度顺序组装，只保留公开状态的活动
+        //    （顺序以 hotIds 为准，而不是数据库返回顺序！）
+        List<Activity> publicActivities = new ArrayList<>();
+        for (Long hotId : hotIds) {
+            Activity activity = activityMap.get(hotId);
+            if (activity == null) {
+                // 排行榜残留了已删除/不存在的活动：顺手自愈清除，
+                // 即使 Redis 删除失败也不影响本次返回（removeActivity 内部已吞异常）
+                activityHotRankService.removeActivity(hotId);
+                continue;
+            }
+            if (!isPublicActivityStatus(activity.getStatus())) {
+                // 非公开状态（草稿/待审核/审核拒绝/已下架）不能展示：
+                // 数据库过滤是最后防线，即使 Redis 残留也不泄露给用户；
+                // 同样顺手清理，避免下次再查到无效 ID。
+                activityHotRankService.removeActivity(hotId);
+                continue;
+            }
+            publicActivities.add(activity);
+        }
+        if (publicActivities.isEmpty()) {
+            return List.of();
+        }
+
+        // 5. 批量查分类名和组织者昵称（复用列表查询的批量方法，避免 N+1）
+        Map<Long, String> categoryNameMap = loadCategoryNameMap(publicActivities);
+        Map<Long, String> organizerNicknameMap = loadOrganizerNicknameMap(publicActivities);
+
+        // 6. 逐条转换为 VO（复用列表转换方法，保证与列表页展示字段一致）
+        return publicActivities.stream()
                 .map(activity -> convertToActivityVO(activity, categoryNameMap, organizerNicknameMap))
                 .collect(Collectors.toList());
     }
@@ -859,6 +1189,34 @@ public class ActivityServiceImpl extends ServiceImpl<ActivityMapper, Activity>
      */
     private boolean isPublicActivityStatus(Integer status) {
         return status != null && PUBLIC_ACTIVITY_STATUSES.contains(status);
+    }
+
+    /**
+     * 判断当前用户是否必须绕过公开缓存（命中缓存也不能直接用）。
+     *
+     * <p>公开缓存（ActivityPublicDetailVO）是所有访问者共用的数据对象，不含审核留痕。
+     * 绝大多数普通访问者可以放心复用缓存，但两类人不行：</p>
+     * <ol>
+     *   <li><b>管理员</b>：需要审计审核过程（谁审的、何时审的、为什么拒）；</li>
+     *   <li><b>活动组织者</b>：需要看到自己活动的驳回原因来修改重新提交。</li>
+     * </ol>
+     * <p>这两类人必须继续回查 MySQL，由 buildActivityDetail 重新组装
+     * 携带审核信息的完整详情 —— 宁可多一次 SQL，也不能丢审核信息。</p>
+     *
+     * @param currentUser  当前登录用户（匿名访问为 null）
+     * @param cachedDetail 命中的公开缓存详情（organizerId 用于判断是否组织者本人）
+     * @return true=必须绕过缓存回查 MySQL；false=可以直接复用缓存
+     */
+    private boolean mustBypassPublicCache(UserVO currentUser, ActivityPublicDetailVO cachedDetail) {
+        // 管理员：任何活动的审核信息都有权查看，一律绕过缓存
+        if (isAdmin(currentUser)) {
+            return true;
+        }
+        // 组织者：缓存里记录了 organizerId，当前用户 ID 与之相同说明他是活动组织者。
+        // 未登录（currentUser 为 null）时不会走到这里，isAdmin 已处理 null 的情况；
+        // 这里再判空是防止缓存数据异常（organizerId 为 null）时 equals 调用空指针。
+        return currentUser != null && currentUser.getId() != null
+                && currentUser.getId().equals(cachedDetail.getOrganizerId());
     }
 
     /**

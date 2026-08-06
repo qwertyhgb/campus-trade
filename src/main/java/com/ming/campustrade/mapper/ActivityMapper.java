@@ -1,5 +1,8 @@
 package com.ming.campustrade.mapper;
 
+import java.time.LocalDateTime;
+import java.util.List;
+
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
@@ -39,4 +42,47 @@ public interface ActivityMapper extends BaseMapper<Activity> {
      */
     @Select("SELECT * FROM activity WHERE id = #{id} AND deleted = 0 FOR UPDATE")
     Activity selectByIdForUpdate(@Param("id") Long id);
+
+    /**
+     * 查询本轮“报名中 → 报名结束”的候选活动 ID（只查 id 列）。
+     *
+     * <p>定时任务在条件更新前调用：选出状态为报名中(3)、且报名截止时间已到
+     * （enroll_end_time &lt;= now）的活动 ID。只查 ID 是为了下一步逐个清除
+     * 这些活动的 Redis 详情缓存；真正执行状态变化的仍是原来的条件 UPDATE，
+     * 本查询只是“候选名单”，与更新相互独立。已排除逻辑删除数据（deleted = 0）。</p>
+     *
+     * @param now 当前时间快照（与条件更新使用同一个时间基准，保证判断一致）
+     * @return 候选活动 ID 列表；无候选时返回空列表
+     */
+    @Select("SELECT id FROM activity "
+            + "WHERE status = 3 AND enroll_end_time <= #{now} AND deleted = 0")
+    List<Long> selectIdsToEnrollEnded(@Param("now") LocalDateTime now);
+
+    /**
+     * 查询本轮“报名结束 → 进行中”的候选活动 ID（只查 id 列）。
+     *
+     * <p>定时任务在条件更新前调用：选出状态为报名结束(4)、且活动开始时间已到
+     * （start_time &lt;= now）的活动 ID。用途与 {@link #selectIdsToEnrollEnded} 相同：
+     * 只作为清缓存候选名单，状态变化仍由条件 UPDATE 决定。已排除逻辑删除数据。</p>
+     *
+     * @param now 当前时间快照（与条件更新使用同一个时间基准）
+     * @return 候选活动 ID 列表；无候选时返回空列表
+     */
+    @Select("SELECT id FROM activity "
+            + "WHERE status = 4 AND start_time <= #{now} AND deleted = 0")
+    List<Long> selectIdsToOngoing(@Param("now") LocalDateTime now);
+
+    /**
+     * 查询本轮“进行中 → 已结束”的候选活动 ID（只查 id 列）。
+     *
+     * <p>定时任务在条件更新前调用：选出状态为进行中(5)、且活动结束时间已到
+     * （end_time &lt;= now）的活动 ID。用途与 {@link #selectIdsToEnrollEnded} 相同：
+     * 只作为清缓存候选名单，状态变化仍由条件 UPDATE 决定。已排除逻辑删除数据。</p>
+     *
+     * @param now 当前时间快照（与条件更新使用同一个时间基准）
+     * @return 候选活动 ID 列表；无候选时返回空列表
+     */
+    @Select("SELECT id FROM activity "
+            + "WHERE status = 5 AND end_time <= #{now} AND deleted = 0")
+    List<Long> selectIdsToFinished(@Param("now") LocalDateTime now);
 }

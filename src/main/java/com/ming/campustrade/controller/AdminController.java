@@ -8,7 +8,9 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.ming.campustrade.annotation.OperationLog;
 import com.ming.campustrade.common.Result;
+import com.ming.campustrade.service.OperationLogService;
 import com.ming.campustrade.service.OrderService;
 import com.ming.campustrade.service.ProductService;
 import com.ming.campustrade.service.UserService;
@@ -55,14 +57,17 @@ public class AdminController {
     private final ProductService productService;
     private final OrderService orderService;
     private final UserService userService;
+    private final OperationLogService operationLogService;
 
     /**
-     * 构造器注入：Spring 启动时自动把三个 Service 的实现类实例传进来。
+     * 构造器注入：Spring 启动时自动把 Service 的实现类实例传进来。
      */
-    public AdminController(ProductService productService, OrderService orderService, UserService userService) {
+    public AdminController(ProductService productService, OrderService orderService,
+                           UserService userService, OperationLogService operationLogService) {
         this.productService = productService;
         this.orderService = orderService;
         this.userService = userService;
+        this.operationLogService = operationLogService;
     }
 
     // ==================== 商品审核 ====================
@@ -96,6 +101,9 @@ public class AdminController {
      * @return 统一响应结果（无数据体）
      */
     @Operation(summary = "审核商品", description = "管理员审核待审核商品，通过则上架，不通过则下架，驳回时可填写原因")
+    // 审核结论会改变商品可见状态，是管理员关键操作，必须自动留痕。
+    // 不把 remark 写入 detail，避免管理员自由文本意外进入审计表。
+    @OperationLog(action = "PRODUCT_REVIEW", targetType = "product", targetIdParam = "id", description = "审核商品")
     @PostMapping("/product/{id}/review")
     public Result<Void> reviewProduct(@Parameter(description = "商品ID") @PathVariable Long id,
                                       @Parameter(description = "审核结果：true通过上架 false不通过下架") @RequestParam Boolean approved,
@@ -158,6 +166,7 @@ public class AdminController {
      * @return 统一响应结果（无数据体）
      */
     @Operation(summary = "封禁用户", description = "封禁指定用户，封禁后该用户无法登录（不能封禁管理员）")
+    @OperationLog(action = "USER_BAN", targetType = "user", targetIdParam = "id", description = "封禁用户")
     @PostMapping("/user/{id}/ban")
     public Result<Void> banUser(@Parameter(description = "用户ID") @PathVariable Long id) {
         log.info("管理员封禁用户：targetUserId={}", id);
@@ -174,10 +183,31 @@ public class AdminController {
      * @return 统一响应结果（无数据体）
      */
     @Operation(summary = "解封用户", description = "解封指定用户，恢复其正常登录使用")
+    @OperationLog(action = "USER_UNBAN", targetType = "user", targetIdParam = "id", description = "解封用户")
     @PostMapping("/user/{id}/unban")
     public Result<Void> unbanUser(@Parameter(description = "用户ID") @PathVariable Long id) {
         log.info("管理员解封用户：targetUserId={}", id);
         userService.unbanUser(id);
         return Result.success();
+    }
+
+    /**
+     * 操作日志分页查询（仅管理员）。
+     *
+     * <p>查看全部关键操作（谁、何时、对什么、做了什么、结果如何），
+     * 供后台审计页面使用；查询只读，不允许修改或删除历史记录。</p>
+     *
+     * @param pageNo 页码，默认 1
+     * @param pageSize 每页条数，默认 20，最大 100
+     * @return 操作日志分页对象
+     */
+    @Operation(summary = "操作日志", description = "管理员分页查看操作审计日志（按操作时间倒序）")
+    @GetMapping("/operation-log/list")
+    public Result<IPage<com.ming.campustrade.entity.OperationLog>> operationLogList(
+            @Parameter(description = "页码，从1开始") @RequestParam(defaultValue = "1") @Min(1) Integer pageNo,
+            @Parameter(description = "每页条数，最大100") @RequestParam(defaultValue = "20")
+            @Min(1) @Max(100) Integer pageSize) {
+        log.info("管理员查询操作日志：pageNo={}, pageSize={}", pageNo, pageSize);
+        return Result.success(operationLogService.page(pageNo, pageSize));
     }
 }

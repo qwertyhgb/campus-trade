@@ -9,6 +9,7 @@ import java.util.stream.Collectors;
 
 import com.ming.campustrade.common.ResultCode;
 import com.ming.campustrade.common.constant.ActivityStatus;
+import com.ming.campustrade.common.constant.RedisConstants;
 import com.ming.campustrade.common.constant.ReservationStatus;
 import com.ming.campustrade.common.constant.WaitlistStatus;
 import com.ming.campustrade.common.exception.BusinessException;
@@ -21,6 +22,9 @@ import com.ming.campustrade.mapper.ActivityMapper;
 import com.ming.campustrade.mapper.ReservationMapper;
 import com.ming.campustrade.mapper.WaitingListMapper;
 import com.ming.campustrade.messaging.NotificationEventPublisher;
+import com.ming.campustrade.service.ActivityCacheService;
+import com.ming.campustrade.service.ActivityHotRankService;
+import com.ming.campustrade.service.OperationLogService;
 import com.ming.campustrade.service.WaitlistService;
 import com.ming.campustrade.utils.UserHolder;
 import com.ming.campustrade.vo.UserVO;
@@ -82,13 +86,43 @@ public class WaitlistServiceImpl implements WaitlistService {
      */
     private final NotificationEventPublisher notificationEventPublisher;
 
+    /**
+     * 活动详情缓存组件：候补变更后清除活动详情缓存（Cache-Aside 的“写后失效”）。
+     *
+     * <p>活动公开详情里有 waitingListCount（有效候补人数），加入/取消候补、
+     * 自动补位都会改变它，必须删除 activity:detail:{activityId}，
+     * 否则详情页展示的是过期人数。Redis 只加速读，MySQL 才是最终依据；
+     * evict 内部已吞掉 Redis 异常，删缓存失败不影响候补业务。</p>
+     */
+    private final ActivityCacheService activityCacheService;
+
+    /**
+     * 活动热度排行榜组件：加入候补成功后累计热度（排行榜仅展示，不影响核心业务）。
+     *
+     * <p>排行榜是纯展示数据：热度只用于“哪些活动更热门”的排序展示，
+     * 绝不参与预约名额判断、候补排序或状态流转 —— 那些必须以 MySQL 为准。
+     * Redis 出错由本组件内部降级，不影响候补主流程。</p>
+     */
+    private final ActivityHotRankService activityHotRankService;
+
+    /**
+     * 操作审计服务：自动补位不是用户主动点击，因此使用 recordSystem 留下系统操作证据。
+     */
+    private final OperationLogService operationLogService;
+
     public WaitlistServiceImpl(ActivityMapper activityMapper, WaitingListMapper waitingListMapper,
                                ReservationMapper reservationMapper,
-                               NotificationEventPublisher notificationEventPublisher) {
+                               NotificationEventPublisher notificationEventPublisher,
+                               ActivityCacheService activityCacheService,
+                               ActivityHotRankService activityHotRankService,
+                               OperationLogService operationLogService) {
         this.activityMapper = activityMapper;
         this.waitingListMapper = waitingListMapper;
         this.reservationMapper = reservationMapper;
         this.notificationEventPublisher = notificationEventPublisher;
+        this.activityCacheService = activityCacheService;
+        this.activityHotRankService = activityHotRankService;
+        this.operationLogService = operationLogService;
     }
 
     /**
@@ -247,6 +281,21 @@ public class WaitlistServiceImpl implements WaitlistService {
             }
         });
 
+        // ===== 5.11.5 事务提交后删除活动详情缓存 =====
+        // 加入候补后 waitingListCount +1，旧缓存里的候补人数已过期。
+        // 与通知回调分开注册：缓存删除和消息发送是相互独立的辅助能力，
+        // 不放进通知的 try-catch —— evict 内部已吞异常，不会影响候补主流程。
+        evictActivityCacheAfterCommit(activityId);
+
+        // ===== 5.11.6 事务提交后记录活动热度 +5 =====
+        // 加入候补也是用户对活动的兴趣行为，成功后给热门排行榜加分；
+        // 独立的后置动作，不放进通知的 try-catch ——
+        // Redis 出错由 ActivityHotRankService 内部降级，绝不影响已提交的候补。
+        // 注意：自动补位不加热度 —— 补位是系统流程而非新的用户兴趣，
+        // 否则同一位候补用户会被“加入候补 + 自动补位”重复加分，热度失真。
+        publishAfterCommit(() -> activityHotRankService.recordHeat(
+                activityId, RedisConstants.ACTIVITY_HOT_WAITLIST_SCORE));
+
         // ===== 5.12 日志 =====
         log.info("加入候补成功：userId={}, activityId={}, position={}", userId, activityId, position);
     }
@@ -298,6 +347,12 @@ public class WaitlistServiceImpl implements WaitlistService {
             // 例如两个请求同时取消：其中一个已经先更新成功，另一个就匹配不到条件。
             throw new BusinessException(ResultCode.WAITLIST_STATUS_ERROR);
         }
+
+        // 本方法没有事务且只有一条条件更新：更新成功即代表数据已持久化，
+        // 立即删缓存即可，不需要为此额外加 @Transactional 或 afterCommit 回调。
+        // 取消候补后 waitingListCount -1，旧缓存里的候补人数已过期。
+        // evict 内部已吞异常，删除失败不影响取消结果。
+        activityCacheService.evict(activityId);
 
         log.info("取消候补成功：userId={}, activityId={}, waitlistId={}",
                 userId, activityId, waitlist.getId());
@@ -420,6 +475,23 @@ public class WaitlistServiceImpl implements WaitlistService {
             // 防御性兜底：调用方没有开启事务时直接执行
             task.run();
         }
+    }
+
+    /**
+     * 事务提交后删除活动详情缓存（Cache-Aside 的“写后失效”）。
+     *
+     * <p><b>为什么必须提交后删除？</b><br>
+     * Redis 只加速读，MySQL 事务成功提交后数据才真正变化；
+     * 如果先删缓存、随后事务回滚，等于白白丢了一次有效缓存（无谓的缓存穿透）。
+     * 所以统一复用 {@link #publishAfterCommit}，只有事务真正提交成功才删缓存。</p>
+     *
+     * <p>缓存删除是幂等操作：同一活动的多个变更重复删除同一个 Key 没有问题，
+     * 删不存在的 Key 只是返回 0。</p>
+     *
+     * @param activityId 活动 ID
+     */
+    private void evictActivityCacheAfterCommit(Long activityId) {
+        publishAfterCommit(() -> activityCacheService.evict(activityId));
     }
 
     // ==================== 候补补位 ====================
@@ -567,6 +639,12 @@ public class WaitlistServiceImpl implements WaitlistService {
             log.info("候补补位成功：userId={}, activityId={}, 原排队位置={}, 当前名额={}/{}",
                     first.getUserId(), activityId, first.getQueuePosition(), currentCount, maxCount);
 
+            // 这次状态改变由系统自动执行，不应错误归因给“刚取消预约的用户”。
+            // targetId 选择候补记录 ID，之后可精确追溯是哪一条候补被提升。
+            operationLogService.recordSystem("WAITLIST_PROMOTE", "waitlist", first.getId(),
+                    "系统自动补位为正式预约，activityId=" + activityId,
+                    true, null);
+
             // 收集补位成功事件（先只存内存，不发送）
             promotedEvents.add(WaitlistPromotedEvent.create(
                     first.getUserId(), activityId, first.getId()));
@@ -584,6 +662,13 @@ public class WaitlistServiceImpl implements WaitlistService {
         // 收集完所有事件，等本事务（REQUIRES_NEW）提交后统一发送，
         // 保证消费者处理通知时，所有补位数据都已持久化可见。
         if (!promotedEvents.isEmpty()) {
+            // ===== 2.7.5 事务提交后删除活动详情缓存（只清一次） =====
+            // 本次确实至少成功补位了一人：已报名人数 +1、有效候补人数 -1，
+            // 旧详情缓存已过期，事务提交后删除。
+            // 循环补了多个人也只删一次 Key：删除后下一次详情查询会从 MySQL
+            // 得到所有补位的最终汇总数据，重复删除没有意义（缓存删除是幂等操作）。
+            publishAfterCommit(() -> activityCacheService.evict(activityId));
+
             publishAfterCommit(() -> {
                 for (WaitlistPromotedEvent event : promotedEvents) {
                     try {

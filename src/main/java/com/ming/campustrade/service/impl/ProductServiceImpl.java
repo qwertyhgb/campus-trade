@@ -28,6 +28,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
 import java.time.Duration;
@@ -275,7 +277,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         // 8. 清除 Redis 缓存（Cache-Aside 模式的"写后失效"策略）
         //    商品数据变了，缓存里的旧数据必须删掉，否则用户会看到修改前的信息。
         //    下次查询时会重新从 MySQL 加载最新数据并写入缓存。
-        evictProductCache(id);
+        evictProductCacheAfterCommit(id);
 
         log.info("编辑商品成功：productId={}", id);
     }
@@ -347,8 +349,10 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         favoriteWrapper.eq(Favorite::getProductId, id);
         int deletedFavorites = favoriteMapper.delete(favoriteWrapper);
     
-        // 6. 清除缓存：商品已删除，缓存必须失效，否则用户还能看到已删除的商品
-        evictProductCache(id);
+        // 6. 清除缓存：商品已删除，缓存必须失效，否则用户还能看到已删除的商品。
+        //    deleteProduct 是多表事务，真正删除动作要等事务提交成功后再执行；
+        //    若任一关联表操作失败并回滚，旧缓存仍应保留。
+        evictProductCacheAfterCommit(id);
     
         log.info("删除商品成功：productId={}, 同步清理留言{}条、收藏{}条", id, deletedComments, deletedFavorites);
     }
@@ -753,7 +757,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         }
     
         // 5. 清除缓存：状态变了，缓存必须失效
-        evictProductCache(id);
+        evictProductCacheAfterCommit(id);
     
         log.info("修改商品状态成功：productId={}, {} → {}", id, current, status);
     }
@@ -862,7 +866,7 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         }
 
         // 5. 清除缓存（状态变了，缓存必须失效）
-        evictProductCache(id);
+        evictProductCacheAfterCommit(id);
 
         log.info("审核商品完成：productId={}, 结果={}", id, approved ? "通过上架" : "不通过驳回");
     }
@@ -987,6 +991,31 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             // 缓存最迟在 TTL 到期后自然失效，不会造成永久数据不一致
             log.warn("清除商品缓存失败（不影响数据正确性，缓存将自然过期）：productId={}", productId, e);
         }
+    }
+
+    /**
+     * 在数据库事务提交后再清理商品缓存；没有事务时立即执行。
+     *
+     * <p>商品编辑、状态修改等方法可能是单条 SQL 自动提交，也可能在以后被别的事务方法复用。
+     * 统一从这里进入，就不用让每个业务方法自己判断“现在能不能删 Redis”。
+     * 事务回滚时 afterCommit 不会触发，所以不会出现缓存先失效、数据库却没改成功的情况。</p>
+     *
+     * @param productId 要失效缓存的商品 ID
+     */
+    private void evictProductCacheAfterCommit(Long productId) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()
+                && TransactionSynchronizationManager.isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    evictProductCache(productId);
+                }
+            });
+            return;
+        }
+
+        // 没有显式事务时，MyBatis 的单条写操作已经自动提交，可以立刻失效缓存。
+        evictProductCache(productId);
     }
 
     /**
